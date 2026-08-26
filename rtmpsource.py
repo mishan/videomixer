@@ -26,6 +26,7 @@ rebuild.
 """
 
 import logging
+import random
 import threading
 
 import gi
@@ -49,11 +50,19 @@ class RtmpSource:
     # holds that caller-facing value.
     ZORDER_OFFSET = 1
 
-    # Reconnect backoff: 1, 2, 4, 8, 16, then 30s forever. A source that
-    # disappears for an hour still comes back on its own, and the cap stops a
-    # permanently dead endpoint from hammering the server.
-    RECONNECT_INITIAL_DELAY = 1
-    RECONNECT_MAX_DELAY = 30
+    # Reconnect backoff: 1, 2, 4, 8, then 10s forever, never giving up. The cap
+    # doubles as the worst case for how long a layer stays black once its
+    # source is reachable again, so it is kept short deliberately: a source
+    # cycling faster than the current delay has every retry land in one of its
+    # gaps, and a high cap can miss it for several cycles.
+    RECONNECT_INITIAL_DELAY = 1.0
+    RECONNECT_MAX_DELAY = 10.0
+
+    # Fraction of each delay that is randomised. One outage usually takes every
+    # source with it, and without jitter they all come back on the same
+    # schedule and retry in lockstep forever, hitting the server in bursts.
+    # Half the delay is kept so the backoff still has its shape.
+    RECONNECT_JITTER = 0.5
 
     # Seconds without a packet before the connection is treated as dead. A
     # half-open TCP connection produces no EOS and no error, so without this a
@@ -334,17 +343,30 @@ class RtmpSource:
         self._schedule_reconnect()
         return GLib.SOURCE_REMOVE
 
+    @classmethod
+    def backoff_delay(cls, attempt, rand=random.random):
+        """Seconds to wait before the given (zero-based) retry attempt.
+
+        Exponential up to the cap, with the back half of each interval
+        randomised so sources knocked out by one outage do not line up and
+        retry together.
+        """
+        base = min(cls.RECONNECT_INITIAL_DELAY * (2 ** attempt),
+                   cls.RECONNECT_MAX_DELAY)
+        return base - base * cls.RECONNECT_JITTER * rand()
+
     def _schedule_reconnect(self):
         with self._lock:
             if self._closed:
                 return
-            delay = min(self.RECONNECT_INITIAL_DELAY * (2 ** self.reconnect_attempts),
-                        self.RECONNECT_MAX_DELAY)
+            delay = self.backoff_delay(self.reconnect_attempts)
             self.reconnect_attempts += 1
             attempt = self.reconnect_attempts
-            self._reconnect_timer = GLib.timeout_add_seconds(
-                delay, self._try_reconnect)
-        log.info('[%s] reconnect attempt %d in %ds',
+            # Milliseconds, not seconds: jitter puts delays on fractions and
+            # timeout_add_seconds would round them all back into lockstep.
+            self._reconnect_timer = GLib.timeout_add(
+                int(delay * 1000), self._try_reconnect)
+        log.info('[%s] reconnect attempt %d in %.1fs',
                  self.location, attempt, delay)
 
     def _try_reconnect(self):

@@ -145,10 +145,21 @@ Reconnection
 ------------
 
 Sources reconnect on their own. If a publisher drops, the layer goes black, the
-output keeps running, and the source retries at 1s, 2s, 4s, 8s, 16s and then
-every 30s indefinitely until it comes back. Geometry survives, so the layer
+output keeps running, and the source retries at roughly 1s, 2s, 4s, 8s and then
+every 10s indefinitely until it comes back. Geometry survives, so the layer
 returns exactly where it was. This also means a PiP can be added before its
 camera is live — it simply retries until the stream appears.
+
+Each delay is jittered across the back half of its interval (so the "1s" retry
+actually falls between 0.5s and 1s). One outage usually takes every source with
+it, and without jitter they would all come back on an identical schedule and
+retry in lockstep forever, hitting the server in bursts.
+
+The cap is deliberately low, because it is also the worst case for how long a
+layer stays black once its source is reachable again. At 30s, a source cycling
+faster than the current delay had every retry land in one of its gaps: four
+consecutive 4s-up/3s-down cycles produced no recovery at all. At 10s the same
+pattern recovers on each cycle.
 
 `GET /stream/{id}` reports the state of each source:
 
@@ -304,9 +315,8 @@ Known gaps
 
 * Audio focus, ducking and normalization are not implemented — every source is
   mixed at unity gain.
-* Recovery latency is bounded by the backoff cap. Once a source is reachable
-  again it can take up to `RECONNECT_MAX_DELAY` (30s) to be picked up, and a
-  source that flaps faster than the current delay — up for a few seconds at a
-  time — can be missed for several cycles, because each retry lands in a gap.
-  It always recovers once the source stays up; it just may not catch a brief
-  window. Lower the cap if fast recovery matters more than connection load.
+* Recovery latency is bounded by the backoff cap: once a source is reachable
+  again it can take up to `RECONNECT_MAX_DELAY` (10s) to be picked up. A source
+  flapping faster than that can still miss a window, though it recovers on the
+  following cycle. Lowering the cap further trades connection load for recovery
+  time.

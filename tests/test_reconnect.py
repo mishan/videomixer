@@ -46,8 +46,8 @@ def scheduler(monkeypatch):
             self.removed = []
             self._next_id = 1
 
-        def timeout_add_seconds(self, delay, callback, *args):
-            self.timers.append((delay, callback))
+        def timeout_add(self, delay_ms, callback, *args):
+            self.timers.append((delay_ms / 1000.0, callback))
             self._next_id += 1
             return self._next_id
 
@@ -61,6 +61,7 @@ def scheduler(monkeypatch):
 
         @property
         def delays(self):
+            """Scheduled delays, in seconds. Jittered, so compare as ranges."""
             return [d for d, _ in self.timers]
 
         def fire_last(self):
@@ -69,7 +70,7 @@ def scheduler(monkeypatch):
             return callback()
 
     s = Scheduler()
-    monkeypatch.setattr(GLib, 'timeout_add_seconds', s.timeout_add_seconds)
+    monkeypatch.setattr(GLib, 'timeout_add', s.timeout_add)
     monkeypatch.setattr(GLib, 'idle_add', s.idle_add)
     monkeypatch.setattr(GLib, 'source_remove', s.source_remove)
     return s
@@ -99,24 +100,86 @@ def test_idle_timeout_is_set(source):
         rtmpsource.RtmpSource.IDLE_TIMEOUT
 
 
+def expected_range(attempt):
+    """The window a jittered delay for this attempt must fall in."""
+    src = rtmpsource.RtmpSource
+    base = min(src.RECONNECT_INITIAL_DELAY * (2 ** attempt),
+               src.RECONNECT_MAX_DELAY)
+    return base * (1 - src.RECONNECT_JITTER), base
+
+
 def test_disconnect_records_state_and_schedules_a_retry(source, scheduler):
     source.handle_disconnect('publisher ended the stream')
     assert source.state == rtmpsource.RECONNECTING
     assert source.last_error == 'publisher ended the stream'
     assert source.reconnect_attempts == 1
-    assert scheduler.delays == [1]
+    low, high = expected_range(0)
+    assert low <= scheduler.delays[0] <= high
 
 
 def test_backoff_is_exponential_and_capped(source, scheduler):
-    """1, 2, 4, 8, 16, then flat at the cap -- forever, never giving up."""
+    """1, 2, 4, 8, then flat at the cap -- forever, never giving up."""
     source.handle_disconnect('gone')
     for _ in range(8):
         scheduler.fire_last()          # retry runs, builds elements again
         source.handle_disconnect('still gone')
+
+    for attempt, delay in enumerate(scheduler.delays):
+        low, high = expected_range(attempt)
+        assert low <= delay <= high, \
+            'attempt {} delay {:.2f} outside {:.2f}-{:.2f}'.format(
+                attempt, delay, low, high)
+
     cap = rtmpsource.RtmpSource.RECONNECT_MAX_DELAY
-    assert scheduler.delays[:6] == [1, 2, 4, 8, 16, cap]
-    assert scheduler.delays[-1] == cap
     assert all(d <= cap for d in scheduler.delays)
+    # Growing, allowing for jitter overlap between neighbouring attempts.
+    assert scheduler.delays[-1] > scheduler.delays[0]
+
+
+def test_worst_case_recovery_latency_stays_bounded():
+    """The cap is how long a layer can stay black after its source returns.
+
+    Pinned rather than derived, because every other assertion here reads the
+    constant and would happily follow it upwards. Raising this trades away
+    recovery time on live video: at 30s a source cycling faster than the delay
+    had every retry land in one of its gaps and went unrecovered for cycles.
+    """
+    assert rtmpsource.RtmpSource.RECONNECT_MAX_DELAY <= 10.0
+
+
+class TestJitter:
+    """Without jitter, every source dropped by one outage retries in unison."""
+
+    def test_delay_never_exceeds_the_backoff_for_that_attempt(self):
+        for attempt in range(8):
+            low, high = expected_range(attempt)
+            for _ in range(500):
+                delay = rtmpsource.RtmpSource.backoff_delay(attempt)
+                assert low <= delay <= high
+
+    def test_delays_are_actually_spread_out(self):
+        """A constant here would mean the jitter is not doing anything."""
+        delays = {rtmpsource.RtmpSource.backoff_delay(4) for _ in range(200)}
+        assert len(delays) > 100, 'delays are not being randomised'
+
+    def test_jitter_keeps_the_back_half_of_the_interval(self):
+        """Bounds check against a stubbed RNG, both extremes."""
+        src = rtmpsource.RtmpSource
+        base = src.RECONNECT_MAX_DELAY
+        assert src.backoff_delay(9, rand=lambda: 0.0) == base
+        assert src.backoff_delay(9, rand=lambda: 1.0) == \
+            base * (1 - src.RECONNECT_JITTER)
+
+    def test_two_sources_do_not_line_up(self, mixer, scheduler):
+        """The lockstep this exists to prevent."""
+        sources = [mixer.add_rtmp_source('s%d' % i, DEAD_RTMP_URL)
+                   for i in range(8)]
+        for source in sources:
+            source.handle_disconnect('shared outage')
+        assert len(set(scheduler.delays)) > 1, \
+            'every source retried on the same schedule'
+        for source in sources:
+            source.remove()
 
 
 def test_a_failed_retry_arms_the_next_one(source, scheduler):
@@ -250,7 +313,8 @@ class TestFlapping:
             simulate_stream_arriving(mixer, source)
             assert source.reconnect_attempts == 0
             source.handle_disconnect('flap')
-            assert scheduler.delays[-1] == 1
+            low, high = expected_range(0)
+            assert low <= scheduler.delays[-1] <= high
             scheduler.fire_last()
 
     def test_source_stays_usable_after_sustained_flapping(
@@ -302,7 +366,8 @@ class TestEosProbe:
         # Dropped so it never reaches the mixers and marks their pads done.
         assert result == Gst.PadProbeReturn.DROP
         assert source.state == rtmpsource.RECONNECTING
-        assert scheduler.delays == [1]
+        low, high = expected_range(0)
+        assert low <= scheduler.delays[0] <= high
 
     def test_other_events_pass_through_untouched(self, source, scheduler):
         result = source._on_src_event(None, self._flush_probe_info())
