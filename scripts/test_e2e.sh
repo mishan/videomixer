@@ -15,6 +15,12 @@ API="${API:-http://localhost:8888}"
 RTMP_HOST_URL="${RTMP_HOST_URL:-rtmp://localhost:1935/live}"
 RTMP_NET_URL="${RTMP_NET_URL:-rtmp://rtmp:1935/live}"
 STREAM_ID="${STREAM_ID:-e2e}"
+# Seconds of mixed output to capture before checking it.
+RECORD_TIMEOUT="${RECORD_TIMEOUT:-8}"
+# How long to let each stage settle. Lower these to speed up a local run.
+SETTLE_PUBLISH="${SETTLE_PUBLISH:-5}"
+SETTLE_CREATE="${SETTLE_CREATE:-5}"
+SETTLE_PIP="${SETTLE_PIP:-8}"
 WORKDIR="$(mktemp -d)"
 PIDS=()
 
@@ -31,6 +37,7 @@ need() { command -v "$1" >/dev/null || { echo "error: $1 is required" >&2; exit 
 need ffmpeg
 need ffprobe
 need curl
+need timeout
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
@@ -65,7 +72,7 @@ pass "API is healthy"
 say "Publishing source streams"
 publish testpattern 400 640x360 testsrc
 publish cam         900 320x180 smptebars
-sleep 5
+sleep "$SETTLE_PUBLISH"
 pass "two publishers running"
 
 say "Creating mixed stream"
@@ -78,7 +85,7 @@ curl -sf -H 'Content-Type: application/json' -X PUT \
 sed 's/^/  /' "$WORKDIR/create.json"; echo
 grep -q '"status": "OK"' "$WORKDIR/create.json" || fail "could not create stream"
 pass "stream created"
-sleep 5
+sleep "$SETTLE_CREATE"
 
 say "Adding a picture-in-picture to the running stream"
 curl -sf -H 'Content-Type: application/json' -X PUT \
@@ -89,13 +96,18 @@ curl -sf -H 'Content-Type: application/json' -X PUT \
 sed 's/^/  /' "$WORKDIR/pip.json"; echo
 grep -q '"status": "OK"' "$WORKDIR/pip.json" || fail "could not add PiP"
 pass "PiP added without restarting the pipeline"
-sleep 8
+sleep "$SETTLE_PIP"
 
 say "Recording the mixed output"
-ffmpeg -nostdin -loglevel error -i "$RTMP_HOST_URL/mixed" -t 5 -c copy \
-    -y "$WORKDIR/mixed.flv" >"$WORKDIR/record.log" 2>&1 \
-    || fail "could not pull the mixed stream (see $WORKDIR/record.log)"
-[ -s "$WORKDIR/mixed.flv" ] || fail "mixed output is empty -- the pipeline is stalled"
+# Bound the capture by wall clock rather than with -t. Against a live RTMP
+# source -t is unreliable as either an input or an output option -- it can
+# fail to reach its stop condition and block indefinitely. SIGINT makes ffmpeg
+# finalize the file, and FLV is streamable so a truncated capture is still
+# valid. timeout exits non-zero on signal, hence the || true.
+timeout -s INT "$RECORD_TIMEOUT" \
+    ffmpeg -nostdin -loglevel error -i "$RTMP_HOST_URL/mixed" -c copy \
+    -y "$WORKDIR/mixed.flv" >"$WORKDIR/record.log" 2>&1 || true
+[ -s "$WORKDIR/mixed.flv" ] || fail "mixed output is empty -- the pipeline is stalled (see $WORKDIR/record.log)"
 pass "recorded $(stat -c%s "$WORKDIR/mixed.flv") bytes"
 
 say "Verifying the output"
@@ -116,14 +128,17 @@ pass "AAC audio present"
 mean=$(ffmpeg -nostdin -v info -i "$WORKDIR/mixed.flv" -af volumedetect \
        -f null /dev/null 2>&1 | grep -oE 'mean_volume: [-0-9.]+' \
        | cut -d' ' -f2 || true)
-if [ -n "$mean" ]; then
-    # Digital silence reports about -91 dB, so anything below -80 means the
-    # audio track exists but carries nothing.
-    if awk -v m="$mean" 'BEGIN{exit !(m+0 < -80)}'; then
-        fail "audio track is silent (${mean} dB)"
-    fi
-    pass "audio carries signal (${mean} dB mean)"
+# An empty result means volumedetect decoded no samples at all -- the FLV
+# declares an AAC track but carries no audio packets. That is a real failure
+# and must not be skipped over quietly.
+[ -n "$mean" ] || fail "could not measure audio: the stream declares an AAC track but delivered no packets"
+
+# Digital silence reports about -91 dB, so anything below -80 means the audio
+# track exists but carries nothing.
+if awk -v m="$mean" 'BEGIN{exit !(m+0 < -80)}'; then
+    fail "audio track is silent (${mean} dB)"
 fi
+pass "audio carries signal (${mean} dB mean)"
 
 say "Stream state"
 curl -sf "$API/stream/$STREAM_ID"; echo
