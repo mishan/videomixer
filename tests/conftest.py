@@ -12,7 +12,30 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import gi  # noqa: E402
+try:
+    import gi  # noqa: E402
+except ImportError as exc:  # pragma: no cover - environment problem
+    raise RuntimeError(
+        '\n'
+        'PyGObject (gi) is not importable, so the tests cannot run.\n'
+        '\n'
+        'It is installed from your distro rather than pip, because it has to\n'
+        'match the system GObject introspection typelibs:\n'
+        '\n'
+        '    sudo apt install python3-gi gir1.2-gstreamer-1.0 \\\n'
+        '        gstreamer1.0-plugins-{base,good,bad,ugly} gstreamer1.0-libav\n'
+        '\n'
+        'A virtualenv hides system packages unless it is told not to, which is\n'
+        'the usual cause of this. Recreate yours with --system-site-packages:\n'
+        '\n'
+        '    python3 -m venv --system-site-packages ~/.virtualenvs/videomixer\n'
+        '    ~/.virtualenvs/videomixer/bin/pip install -r requirements-dev.txt\n'
+        '\n'
+        'Or run the suite in the container, which already has everything:\n'
+        '\n'
+        '    make unit-docker\n'
+    ) from exc
+
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst  # noqa: E402
 

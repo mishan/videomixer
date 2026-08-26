@@ -191,8 +191,21 @@ Dev dependencies live in `requirements-dev.txt`, not `requirements.txt` — the
 latter is what the Dockerfile installs, and a linter has no business in the
 runtime image.
 
-    pip install -r requirements-dev.txt
+### Your virtualenv has to see the system PyGObject
+
+`gi` comes from your distro, not pip, because it has to match the system
+GObject introspection typelibs. A virtualenv hides system packages unless
+told otherwise, so a plain `python3 -m venv` leaves `import gi` failing and
+nothing will run — not even the API tests, since `mixerapi` imports
+`videomixer` which imports `gi`.
+
+    make venv          # python3 -m venv --system-site-packages .venv
+    . .venv/bin/activate
     make check
+
+For an existing venv, recreate it with `--system-site-packages`; the flag
+cannot be added afterwards. If you would rather not set GStreamer up on the
+host at all, `make unit-docker` runs the suite inside the container.
 
 ### Tests
 
