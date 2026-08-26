@@ -173,6 +173,28 @@ Other things that changed
   which has been EOL since 2020 and whose repos have moved to archive.
 
 
+Development
+-----------
+
+`make` on its own lists the available targets:
+
+| target | does                                        |
+|--------|---------------------------------------------|
+| `dev`  | install dev dependencies (flake8)           |
+| `lint` | run flake8, configured in `setup.cfg`       |
+| `test` | bring the stack up and run the e2e check    |
+| `up`   | build and start the compose stack           |
+| `down` | stop the stack and remove volumes           |
+| `logs` | follow the container logs                   |
+
+Lint dependencies live in `requirements-dev.txt`, not `requirements.txt` — the
+latter is what the Dockerfile installs, and a linter has no business in the
+runtime image.
+
+    pip install -r requirements-dev.txt
+    make lint
+
+
 Running without Docker
 ----------------------
 

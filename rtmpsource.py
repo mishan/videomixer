@@ -214,7 +214,7 @@ class RtmpSource:
 
         pad_template = self.audiomixer.get_pad_template('sink_%u')
         self.audiomixer_pad = self.audiomixer.request_pad(pad_template,
-                                                           None, None)
+                                                          None, None)
         if self.audiomixer_pad is None:
             log.error('[%s] could not obtain an audiomixer sink pad',
                       self.location)
