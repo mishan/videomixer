@@ -1,0 +1,218 @@
+"""Reconnect state machine.
+
+A dropped publisher is invisible at the pipeline level -- the mixer's base
+layers never end, so no EOS reaches the bus. Detection hangs off a pad probe
+instead, and these cover the machinery that probe drives.
+
+GLib's idle and timer callbacks are intercepted so the sequence can be stepped
+through deterministically without a main loop: idle callbacks run inline, and
+scheduled retries are recorded rather than armed.
+"""
+
+import pytest
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import Gst, GLib  # noqa: E402
+
+import rtmpsource  # noqa: E402
+
+from conftest import DEAD_RTMP_URL  # noqa: E402
+
+
+@pytest.fixture
+def scheduler(monkeypatch):
+    """Run idle callbacks inline and capture timer callbacks."""
+    class Scheduler:
+        def __init__(self):
+            self.timers = []      # (delay, callback)
+            self.removed = []
+            self._next_id = 1
+
+        def timeout_add_seconds(self, delay, callback, *args):
+            self.timers.append((delay, callback))
+            self._next_id += 1
+            return self._next_id
+
+        def idle_add(self, callback, *args):
+            callback(*args)
+            return 0
+
+        def source_remove(self, tag):
+            self.removed.append(tag)
+            return True
+
+        @property
+        def delays(self):
+            return [d for d, _ in self.timers]
+
+        def fire_last(self):
+            """Run the most recently scheduled retry."""
+            _, callback = self.timers[-1]
+            return callback()
+
+    s = Scheduler()
+    monkeypatch.setattr(GLib, 'timeout_add_seconds', s.timeout_add_seconds)
+    monkeypatch.setattr(GLib, 'idle_add', s.idle_add)
+    monkeypatch.setattr(GLib, 'source_remove', s.source_remove)
+    return s
+
+
+@pytest.fixture
+def source(mixer, scheduler):
+    s = mixer.add_rtmp_source('bg', DEAD_RTMP_URL, xpos=10, ypos=20,
+                              zorder=3, width=160, height=90)
+    yield s
+    # Retire the source while GLib is still patched. The mixer fixture is torn
+    # down after this one, and by then the real GLib.source_remove is back and
+    # would warn about the fake timer ids handed out here.
+    s.remove()
+    mixer.sources.pop('bg', None)
+
+
+def test_starts_out_connecting(source):
+    assert source.state == rtmpsource.CONNECTING
+    assert source.reconnect_attempts == 0
+    assert source.last_error is None
+
+
+def test_idle_timeout_is_set(source):
+    """A half-open connection yields no EOS and no error without this."""
+    assert source.rtmp_src.get_property('idle-timeout') == \
+        rtmpsource.RtmpSource.IDLE_TIMEOUT
+
+
+def test_disconnect_records_state_and_schedules_a_retry(source, scheduler):
+    source.handle_disconnect('publisher ended the stream')
+    assert source.state == rtmpsource.RECONNECTING
+    assert source.last_error == 'publisher ended the stream'
+    assert source.reconnect_attempts == 1
+    assert scheduler.delays == [1]
+
+
+def test_backoff_is_exponential_and_capped(source, scheduler):
+    """1, 2, 4, 8, 16, then flat at the cap -- forever, never giving up."""
+    source.handle_disconnect('gone')
+    for _ in range(8):
+        scheduler.fire_last()          # retry runs, builds elements again
+        source.handle_disconnect('still gone')
+    cap = rtmpsource.RtmpSource.RECONNECT_MAX_DELAY
+    assert scheduler.delays[:6] == [1, 2, 4, 8, 16, cap]
+    assert scheduler.delays[-1] == cap
+    assert all(d <= cap for d in scheduler.delays)
+
+
+def test_a_failed_retry_arms_the_next_one(source, scheduler):
+    """The retry loop used to strand itself after a single attempt.
+
+    handle_disconnect keyed off the state, so once it was RECONNECTING the
+    failure of the retry itself was swallowed and nothing rescheduled.
+    """
+    source.handle_disconnect('gone')
+    assert len(scheduler.timers) == 1
+    scheduler.fire_last()
+    source.handle_disconnect('connection refused')
+    assert len(scheduler.timers) == 2, 'a failed retry did not schedule another'
+
+
+def test_reconnecting_rebuilds_the_elements(source, scheduler):
+    source.handle_disconnect('gone')
+    assert source.elements == [], 'teardown should release the old elements'
+    assert source.compositor_pad is None
+    assert source.audiomixer_pad is None
+    scheduler.fire_last()
+    assert source.elements, 'retry should have rebuilt the source'
+    assert source.rtmp_src.get_factory().get_name() == 'rtmp2src'
+
+
+def test_geometry_survives_a_reconnect(source, scheduler):
+    """The layer has to come back where the caller put it."""
+    source.handle_disconnect('gone')
+    scheduler.fire_last()
+    assert (source.xpos, source.ypos, source.zorder) == (10, 20, 3)
+    assert (source.width, source.height) == (160, 90)
+
+
+def test_recovery_clears_the_error_and_attempt_count(source, scheduler):
+    source.handle_disconnect('gone')
+    scheduler.fire_last()
+    source._mark_connected()
+    assert source.state == rtmpsource.CONNECTED
+    assert source.reconnect_attempts == 0
+    assert source.last_error is None
+
+
+def test_removed_source_stops_reconnecting(source, scheduler):
+    """Removing a source mid-outage must not leave a retry loop running."""
+    source.handle_disconnect('gone')
+    before = len(scheduler.timers)
+    source.remove()
+    source.handle_disconnect('gone again')
+    assert len(scheduler.timers) == before, 'kept retrying after removal'
+    assert scheduler.removed, 'pending retry timer was not cancelled'
+
+
+def test_removal_during_backoff_stops_the_pending_retry(source, scheduler):
+    source.handle_disconnect('gone')
+    source.remove()
+    assert scheduler.fire_last() == GLib.SOURCE_REMOVE
+    assert source.elements == [], 'a cancelled retry rebuilt the source anyway'
+
+
+def test_connection_state_is_reported(source, scheduler):
+    assert source.get_info()['connection'] == {
+        'state': rtmpsource.CONNECTING,
+        'reconnect_attempts': 0,
+        'last_error': None,
+    }
+    source.handle_disconnect('publisher ended the stream')
+    connection = source.get_info()['connection']
+    assert connection['state'] == rtmpsource.RECONNECTING
+    assert connection['reconnect_attempts'] == 1
+    assert connection['last_error'] == 'publisher ended the stream'
+
+
+class TestEosProbe:
+    """EOS on the source pad is the only signal a publisher has gone."""
+
+    def _eos_probe_info(self):
+        class Info:
+            def get_event(self):
+                return Gst.Event.new_eos()
+        return Info()
+
+    def _flush_probe_info(self):
+        class Info:
+            def get_event(self):
+                return Gst.Event.new_flush_start()
+        return Info()
+
+    def test_eos_triggers_a_reconnect_and_is_dropped(self, source, scheduler):
+        result = source._on_src_event(None, self._eos_probe_info())
+        # Dropped so it never reaches the mixers and marks their pads done.
+        assert result == Gst.PadProbeReturn.DROP
+        assert source.state == rtmpsource.RECONNECTING
+        assert scheduler.delays == [1]
+
+    def test_other_events_pass_through_untouched(self, source, scheduler):
+        result = source._on_src_event(None, self._flush_probe_info())
+        assert result == Gst.PadProbeReturn.OK
+        assert source.state == rtmpsource.CONNECTING
+        assert scheduler.timers == []
+
+
+class TestBusRouting:
+    """An error from a source's own elements must reconnect that source."""
+
+    def test_error_is_routed_to_the_owning_source(self, mixer, source):
+        assert mixer._source_for(source.rtmp_src) is source
+
+    def test_error_from_a_nested_element_finds_the_source(self, mixer, source):
+        """Errors usually surface from inside a decodebin, not the top level."""
+        nested = Gst.ElementFactory.make('identity', None)
+        source.elements.append(nested)
+        assert mixer._source_for(nested) is source
+
+    def test_mixer_elements_are_not_attributed_to_a_source(self, mixer, source):
+        assert mixer._source_for(mixer.x264enc) is None
+        assert mixer._source_for(mixer.flvmux) is None

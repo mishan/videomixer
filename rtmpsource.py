@@ -17,17 +17,29 @@ Two rules matter and both were violated by the original implementation:
    will never produce data until told otherwise. Every element added here is
    followed by sync_state_with_parent(), which is what makes it possible to
    add a PiP to a running stream.
+
+Sources also reconnect on their own. A publisher going away is invisible at the
+pipeline level -- rtmp2src emits EOS on its src pad, but the mixer's base layers
+never end, so no EOS ever reaches the bus and nothing is logged. The layer just
+turns black and stays that way. A pad probe catches that EOS and drives the
+rebuild.
 """
 
 import logging
+import threading
 
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst  # noqa: E402
+from gi.repository import Gst, GLib  # noqa: E402
 
 log = logging.getLogger(__name__)
 
 AUDIO_CAPS = 'audio/x-raw,rate=44100,channels=2,format=S16LE,layout=interleaved'
+
+# Connection states reported through the API.
+CONNECTING = 'connecting'
+CONNECTED = 'connected'
+RECONNECTING = 'reconnecting'
 
 
 class RtmpSource:
@@ -36,6 +48,18 @@ class RtmpSource:
     # documented scheme (background z=0, PiPs z>=1) and self.zorder always
     # holds that caller-facing value.
     ZORDER_OFFSET = 1
+
+    # Reconnect backoff: 1, 2, 4, 8, 16, then 30s forever. A source that
+    # disappears for an hour still comes back on its own, and the cap stops a
+    # permanently dead endpoint from hammering the server.
+    RECONNECT_INITIAL_DELAY = 1
+    RECONNECT_MAX_DELAY = 30
+
+    # Seconds without a packet before the connection is treated as dead. A
+    # half-open TCP connection produces no EOS and no error, so without this a
+    # source can sit black forever with nothing to detect. Live RTMP publishers
+    # send continuously, so silence this long means gone.
+    IDLE_TIMEOUT = 15
 
     def __init__(self, location, pipeline, compositor, audiomixer,
                  xpos=0, ypos=0, zorder=1, width=None, height=None):
@@ -57,6 +81,17 @@ class RtmpSource:
         # Request pads we hold on the mixers, released on teardown.
         self.compositor_pad = None
         self.audiomixer_pad = None
+        # Reconnect bookkeeping. The lock matters because disconnects are
+        # detected on a GStreamer streaming thread while the HTTP API can be
+        # removing the same source from another.
+        self._lock = threading.RLock()
+        self._closed = False
+        self._rebuilding = False
+        self._reconnect_timer = None
+        self.state = CONNECTING
+        self.reconnect_attempts = 0
+        self.last_error = None
+
         # Every element we own, so removal is exact.
         self.elements = []
 
@@ -108,9 +143,15 @@ class RtmpSource:
         log.info('Creating RTMP source for %s', self.location)
         # rtmp2src supersedes the librtmp-based rtmpsrc, which fails with
         # "Internal data stream error" against current RTMP servers.
-        self.rtmp_src = self._make('rtmp2src', location=self.location)
+        self.rtmp_src = self._make('rtmp2src', location=self.location,
+                                   idle_timeout=self.IDLE_TIMEOUT)
         self.flvdemux = self._make('flvdemux')
         self.flvdemux.connect('pad-added', self._on_demux_pad_added)
+
+        # A publisher going away shows up here and nowhere else: the mixer's
+        # base layers never end, so this EOS never becomes a bus message.
+        self.rtmp_src.get_static_pad('src').add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_src_event)
 
         if not self.rtmp_src.link(self.flvdemux):
             raise RuntimeError('Could not link rtmp2src -> flvdemux')
@@ -122,6 +163,7 @@ class RtmpSource:
         pad_type = caps.get_structure(0).get_name() if caps else ''
         log.info('[%s] demux pad %s (%s)', self.location, pad.get_name(),
                  pad_type or 'unknown')
+        self._mark_connected()
 
         if pad_type.startswith('video'):
             sink_pad = self._build_video_branch()
@@ -232,6 +274,117 @@ class RtmpSource:
         if capsfilter.get_static_pad('src').link(self.audiomixer_pad) != Gst.PadLinkReturn.OK:
             log.error('[%s] could not link into audiomixer', self.location)
 
+    # -- connection lifecycle ----------------------------------------------
+
+    def _on_src_event(self, pad, info):
+        """Catch the EOS that means the publisher went away.
+
+        Dropped rather than passed on: the branch is about to be torn down, and
+        letting EOS reach the compositor and audiomixer would mark those sink
+        pads finished for no benefit.
+        """
+        event = info.get_event()
+        if event is not None and event.type == Gst.EventType.EOS:
+            self.handle_disconnect('publisher ended the stream')
+            return Gst.PadProbeReturn.DROP
+        return Gst.PadProbeReturn.OK
+
+    def _mark_connected(self):
+        with self._lock:
+            if self.state == CONNECTED:
+                return
+            self._rebuilding = False
+            if self.reconnect_attempts:
+                log.info('[%s] reconnected after %d attempt(s)',
+                         self.location, self.reconnect_attempts)
+            self.state = CONNECTED
+            self.reconnect_attempts = 0
+            self.last_error = None
+
+    def handle_disconnect(self, reason):
+        """Tear the branch down and start trying to get it back.
+
+        Safe to call from a streaming thread: the rebuild is deferred onto the
+        GLib main loop, because doing pipeline surgery from inside a pad probe
+        deadlocks.
+        """
+        with self._lock:
+            # Guard on a rebuild already being in flight rather than on the
+            # state: once a retry is armed the state stays RECONNECTING, and
+            # keying off that would swallow the failure of the retry itself
+            # and strand the source after a single attempt.
+            if self._closed or self._rebuilding:
+                return
+            self._rebuilding = True
+            first_failure = self.state != RECONNECTING
+            self.state = RECONNECTING
+            self.last_error = reason
+        if first_failure:
+            log.warning('[%s] disconnected (%s), will reconnect',
+                        self.location, reason)
+        else:
+            log.info('[%s] reconnect did not take (%s)', self.location, reason)
+        GLib.idle_add(self._rebuild_after_disconnect)
+
+    def _rebuild_after_disconnect(self):
+        with self._lock:
+            if self._closed:
+                return GLib.SOURCE_REMOVE
+        self._teardown_elements()
+        self._schedule_reconnect()
+        return GLib.SOURCE_REMOVE
+
+    def _schedule_reconnect(self):
+        with self._lock:
+            if self._closed:
+                return
+            delay = min(self.RECONNECT_INITIAL_DELAY * (2 ** self.reconnect_attempts),
+                        self.RECONNECT_MAX_DELAY)
+            self.reconnect_attempts += 1
+            attempt = self.reconnect_attempts
+            self._reconnect_timer = GLib.timeout_add_seconds(
+                delay, self._try_reconnect)
+        log.info('[%s] reconnect attempt %d in %ds',
+                 self.location, attempt, delay)
+
+    def _try_reconnect(self):
+        with self._lock:
+            self._reconnect_timer = None
+            if self._closed:
+                return GLib.SOURCE_REMOVE
+        log.info('[%s] reconnecting', self.location)
+        try:
+            self.initialize()
+        except Exception as exc:
+            log.warning('[%s] reconnect failed: %s', self.location, exc)
+            with self._lock:
+                self.last_error = str(exc)
+            self._teardown_elements()
+            self._schedule_reconnect()
+            return GLib.SOURCE_REMOVE
+
+        # The elements exist again, but nothing has arrived yet. Releasing the
+        # guard here is what lets the next failure -- a refused connection
+        # because the publisher is still away -- arm the following attempt.
+        with self._lock:
+            self._rebuilding = False
+        return GLib.SOURCE_REMOVE
+
+    def _teardown_elements(self):
+        """Drop every element and mixer pad, leaving the source rebuildable."""
+        for element in self.elements:
+            element.set_state(Gst.State.NULL)
+        for element in self.elements:
+            self.pipeline.remove(element)
+        self.elements = []
+
+        if self.compositor_pad is not None:
+            self.compositor.release_request_pad(self.compositor_pad)
+            self.compositor_pad = None
+        if self.audiomixer_pad is not None:
+            self.audiomixer.release_request_pad(self.audiomixer_pad)
+            self.audiomixer_pad = None
+
     # -- control -----------------------------------------------------------
 
     def move(self, xpos, ypos, zorder):
@@ -257,24 +410,23 @@ class RtmpSource:
         self.compositor_pad.set_property('height', height or 0)
 
     def remove(self):
-        """Detach this source and free everything it owns."""
+        """Detach this source for good and free everything it owns."""
         log.info('Removing RTMP source %s', self.location)
-        for element in self.elements:
-            element.set_state(Gst.State.NULL)
-        for element in self.elements:
-            self.pipeline.remove(element)
-        self.elements = []
-
-        if self.compositor_pad is not None:
-            self.compositor.release_request_pad(self.compositor_pad)
-            self.compositor_pad = None
-        if self.audiomixer_pad is not None:
-            self.audiomixer.release_request_pad(self.audiomixer_pad)
-            self.audiomixer_pad = None
+        with self._lock:
+            self._closed = True
+            if self._reconnect_timer is not None:
+                GLib.source_remove(self._reconnect_timer)
+                self._reconnect_timer = None
+        self._teardown_elements()
 
     def get_info(self):
         return {
             'location': self.location,
+            'connection': {
+                'state': self.state,
+                'reconnect_attempts': self.reconnect_attempts,
+                'last_error': self.last_error,
+            },
             'source': {
                 'width': self.video_width,
                 'height': self.video_height,

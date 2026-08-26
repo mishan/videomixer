@@ -141,6 +141,38 @@ guarantee the muxer is never starved on either branch. Elements added to a
 running pipeline also get `sync_state_with_parent()`, without which a newly
 added PiP sits in NULL state and silently produces nothing.
 
+Reconnection
+------------
+
+Sources reconnect on their own. If a publisher drops, the layer goes black, the
+output keeps running, and the source retries at 1s, 2s, 4s, 8s, 16s and then
+every 30s indefinitely until it comes back. Geometry survives, so the layer
+returns exactly where it was. This also means a PiP can be added before its
+camera is live — it simply retries until the stream appears.
+
+`GET /stream/{id}` reports the state of each source:
+
+    "connection": {
+      "state": "reconnecting",
+      "reconnect_attempts": 3,
+      "last_error": "Failed to connect: 'play' cmd failed: ..."
+    }
+
+### Why a dropped publisher needs a pad probe to notice
+
+A source going away is invisible at the pipeline level. `rtmp2src` emits EOS on
+its src pad, but an aggregator only forwards EOS once *every* pad has ended, and
+the base layers never end — so nothing reaches the bus, nothing is logged, and
+the layer just turns black and stays that way. A pad probe on `rtmp2src` catches
+that EOS and drives the rebuild; the event is dropped rather than forwarded, so
+it never marks the mixer's own sink pads finished.
+
+Two other paths lead to the same handler. Errors from a source's elements are
+attributed back to the owning source and reconnect it rather than being logged
+and ignored. And `rtmp2src` carries an `idle-timeout`, because a half-open TCP
+connection produces neither EOS nor an error — without it a source can sit black
+forever with nothing to detect.
+
 ### Late-joining sources have to be offset into the running time
 
 Because the base layers are live, `compositor` and `audiomixer` run as live
@@ -270,8 +302,8 @@ typelibs).
 Known gaps
 ----------
 
-* A source that disconnects is not automatically reconnected; the layer goes
-  black and the stream keeps running.
 * Audio focus, ducking and normalization are not implemented — every source is
   mixed at unity gain.
-* There are no unit tests, only the end-to-end script.
+* Reconnection is verified against a publisher that goes away cleanly and one
+  that never returns. A flapping source that reconnects every few seconds is
+  untested.
