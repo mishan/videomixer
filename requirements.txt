@@ -1,2 +1,6 @@
-gbulb
-aiohttp==3.14.3
+# PyGObject is deliberately absent: it comes from the distro (python3-gi) so
+# it matches the system GObject introspection typelibs.
+#
+# gbulb and asyncio_glib are gone too. The GLib main loop now runs on its own
+# thread instead of being fused into the asyncio loop, so neither is needed.
+aiohttp>=3.10,<4
