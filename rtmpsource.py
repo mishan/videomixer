@@ -64,6 +64,31 @@ class RtmpSource:
 
     # -- construction ------------------------------------------------------
 
+    def _align_to_running_time(self, pad):
+        """Shift a late-joining source into the mixer's current running time.
+
+        Both mixers are aggregators driven by live base layers, so by the time
+        an RTMP source has connected, demuxed and decoded -- a second or so --
+        the aggregator has already advanced. A newly linked pad delivers
+        buffers timestamped from the start of *its* stream, which lands in the
+        aggregator's past and gets discarded. The symptom is a source that
+        decodes without a single error yet contributes nothing: silent audio,
+        or a layer that never appears.
+
+        Whether it happened at all came down to timing, which is why this
+        looked intermittent. Offsetting the pad by the running time at which
+        the source joined maps its stream start onto now, deterministically.
+        """
+        clock = self.pipeline.get_clock()
+        if clock is None:
+            return  # not started yet; stream time already lines up
+        running_time = clock.get_time() - self.pipeline.get_base_time()
+        if running_time <= 0:
+            return
+        pad.set_offset(running_time)
+        log.debug('[%s] offset %s by %.3fs', self.location, pad.get_name(),
+                  running_time / Gst.SECOND)
+
     def _make(self, factory, **props):
         element = Gst.ElementFactory.make(factory, None)
         if element is None:
@@ -157,6 +182,7 @@ class RtmpSource:
                       self.location)
             return
 
+        self._align_to_running_time(self.compositor_pad)
         self.compositor_pad.set_property('xpos', self.xpos)
         self.compositor_pad.set_property('ypos', self.ypos)
         self.compositor_pad.set_property('zorder',
@@ -193,6 +219,8 @@ class RtmpSource:
             log.error('[%s] could not obtain an audiomixer sink pad',
                       self.location)
             return
+
+        self._align_to_running_time(self.audiomixer_pad)
 
         if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
             log.error('[%s] could not link decoded audio pad', self.location)

@@ -128,26 +128,29 @@ guarantee the muxer is never starved on either branch. Elements added to a
 running pipeline also get `sync_state_with_parent()`, without which a newly
 added PiP sits in NULL state and silently produces nothing.
 
-### The base layers differ on `is-live`, and it matters
+### Late-joining sources have to be offset into the running time
 
-The black video layer is live; the silent audio layer is **not**. This looks
-inconsistent and is deliberate.
+Because the base layers are live, `compositor` and `audiomixer` run as live
+aggregators and emit on a timer. An RTMP source needs roughly a second to
+connect, demux and decode, by which point the aggregator has already advanced.
+The newly linked pad then delivers buffers timestamped from the start of *its*
+stream, which lands in the aggregator's past and is discarded.
 
-A live source puts `audiomixer` into clock-driven mode, where it emits one
-output window per clock tick and discards anything that does not fall inside
-it. RTMP sources are not live, so their decoded audio lands outside that
-window and is dropped — the mix comes out as pure digital silence even though
-the audio decoded without a single error in the log. Non-live, the aggregator
-waits for all pads instead, and `flvmux` keeps the audio branch paced against
-video.
+The symptom is a source that decodes with no error anywhere in the log yet
+contributes nothing — silent audio, or a layer that never appears. Whether it
+happened at all came down to timing, so it looked intermittent: the same build
+would mix audio correctly on one run and emit an AAC track containing zero
+packets on the next.
 
-`compositor` does not have this problem because it repeats the last buffer on
-a pad with no new data, so the video base layer can stay live and give an
-empty stream real-time black output.
+`RtmpSource._align_to_running_time` fixes it by offsetting each mixer sink pad
+by the running time at which the source joined, mapping its stream start onto
+now. The mixers also carry `min-upstream-latency` and `ignore-inactive-pads`,
+which reserve headroom for sources plugged in after playback started and stop
+a dropped publisher from stalling the mix.
 
-If the mix ever goes silent again while the logs look clean, this is the first
+If the mix ever goes quiet again while the logs look clean, this is the first
 thing to check. `scripts/test_e2e.sh` asserts on mean volume specifically to
-catch it.
+catch it, and fails rather than skipping if it cannot measure a level at all.
 
 
 Other things that changed

@@ -50,6 +50,11 @@ AUDIO_CAPS = 'audio/x-raw,rate=44100,channels=2,format=S16LE,layout=interleaved'
 ENCODER_AUDIO_CAPS = ('audio/x-raw,rate=44100,channels=2,format=F32LE,'
                       'layout=interleaved')
 
+# Headroom the compositor and audiomixer allow for a source to deliver buffers
+# for the position they are currently aggregating. RTMP sources connect,
+# demux and decode over roughly a second, so they need room.
+AGGREGATOR_LATENCY = 1 * Gst.SECOND
+
 
 class VideoMixer:
     """One RTMP output stream, composited from many RTMP inputs."""
@@ -148,8 +153,17 @@ class VideoMixer:
             raise RuntimeError('Could not create GStreamer pipeline')
 
         # --- video ---
+        # Both mixers are aggregators fed by live base layers, so they run in
+        # live mode and emit on a timer. ignore_inactive_pads keeps a source
+        # that has stopped delivering (a dropped RTMP publisher) from stalling
+        # the mix, and min_upstream_latency reserves headroom for sources that
+        # get plugged in after playback has started, which is the normal case
+        # here -- every PiP arrives late.
         self.compositor = self._make('compositor', 'compositor',
-                                     background='black')
+                                     background='black',
+                                     latency=AGGREGATOR_LATENCY,
+                                     min_upstream_latency=AGGREGATOR_LATENCY,
+                                     ignore_inactive_pads=True)
         videoconvert = self._make('videoconvert')
         video_caps = self._make('capsfilter', 'outcaps')
         video_caps.set_property('caps', Gst.Caps.from_string(
@@ -181,7 +195,10 @@ class VideoMixer:
                 self.width, self.height, self.fps)))
 
         # --- audio ---
-        self.audiomixer = self._make('audiomixer', 'audiomixer')
+        self.audiomixer = self._make('audiomixer', 'audiomixer',
+                                     latency=AGGREGATOR_LATENCY,
+                                     min_upstream_latency=AGGREGATOR_LATENCY,
+                                     ignore_inactive_pads=True)
         audio_queue = self._make('queue', 'aqueue',
                                  max_size_time=2 * Gst.SECOND,
                                  leaky=2)
@@ -196,21 +213,10 @@ class VideoMixer:
 
         # The audio equivalent of the black layer: silence that never stops.
         # Without this, a source with no audio track starves flvmux forever.
-        #
-        # is-live MUST stay false here, unlike the video base layer above.
-        # A live source puts audiomixer into clock-driven mode, where it emits
-        # a fixed output window per clock tick and discards anything that does
-        # not fall inside it. RTMP sources are not live, so their decoded audio
-        # lands outside that window and gets dropped -- the mix comes out as
-        # pure digital silence even though the audio decoded correctly.
-        # Non-live, the aggregator instead waits for all pads, and flvmux keeps
-        # the whole branch paced against video.
-        #
-        # compositor does not have this problem because it repeats the last
-        # buffer on a pad that has no new data, which is why the video base
-        # layer can stay live and give an empty stream real-time black output.
+        # Live, like the video base layer -- see RtmpSource._align_to_running_time
+        # for why that does not swallow real audio.
         self.audio_base = self._make('audiotestsrc', 'audiobase',
-                                     wave='silence', is_live=False)
+                                     wave='silence', is_live=True)
         silence_caps = self._make('capsfilter', 'silencecaps')
         silence_caps.set_property('caps', Gst.Caps.from_string(AUDIO_CAPS))
 
