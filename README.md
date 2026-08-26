@@ -6,7 +6,20 @@ number of live RTMP inputs into a single H.264/AAC stream and pushes the result
 to an RTMP destination, with an HTTP API for adding, moving, resizing and
 removing picture-in-picture layers on a running stream.
 
-It started as a hackathon proof of concept. Video mixing worked; audio did not.
+It never got past proof of concept: video mixing worked, audio did not.
+
+
+Origins
+-------
+
+This project began in 2018 as a hackathon project at
+[The Meet Group](https://www.themeetgroup.com/), who open sourced it as
+`themeetgroup/videomixer`. It has since been detached from that repository and
+continues here.
+
+With thanks to The Meet Group for open sourcing it originally. The 2018 work
+remains copyright The Meet Group Inc and the project is still MIT licensed —
+see [LICENSE](LICENSE).
 
 
 Quick start
@@ -187,12 +200,55 @@ Development
 | `down` | stop the stack and remove volumes           |
 | `logs` | follow the container logs                   |
 
-Lint dependencies live in `requirements-dev.txt`, not `requirements.txt` — the
+Dev dependencies live in `requirements-dev.txt`, not `requirements.txt` — the
 latter is what the Dockerfile installs, and a linter has no business in the
 runtime image.
 
-    pip install -r requirements-dev.txt
-    make lint
+### Your virtualenv has to see the system PyGObject
+
+`gi` comes from your distro, not pip, because it has to match the system
+GObject introspection typelibs. A virtualenv hides system packages unless
+told otherwise, so a plain `python3 -m venv` leaves `import gi` failing and
+nothing will run — not even the API tests, since `mixerapi` imports
+`videomixer` which imports `gi`.
+
+    make venv          # python3 -m venv --system-site-packages .venv
+    . .venv/bin/activate
+    make check
+
+For an existing venv, recreate it with `--system-site-packages`; the flag
+cannot be added afterwards. If you would rather not set GStreamer up on the
+host at all, `make unit-docker` runs the suite inside the container.
+
+### Tests
+
+`tests/` runs in well under a second and needs no Docker, no network and no
+RTMP server. `rtmp2sink` only connects on the transition out of NULL, so a
+pipeline can be fully constructed and asserted on without anything opening a
+socket.
+
+They deliberately use real GStreamer rather than mocking it. Every serious bug
+this project had — an encoder silently rejecting caps, an audio branch that
+never reached the muxer, a base layer occluding the background — lived in the
+wiring, and a mock of `Gst` would have accepted all of them. `test_pipeline.py`
+asserts those invariants directly; `test_api.py` covers routing, validation and
+status codes against a fake mixer, including that every handler is a coroutine.
+
+### Regenerating the diagrams
+
+`docs/example_pipeline.png` is a Graphviz dump of a real running pipeline, not
+a hand-drawn picture. Set `GST_DEBUG_DUMP_DOT_DIR` and the mixer writes one on
+every pipeline change (`VideoMixer.dump_dot`); unlike `gst-launch`, an
+application has to ask for these explicitly.
+
+    GST_DEBUG_DUMP_DOT_DIR=/tmp/dot python3 mix.py
+    # create a stream and add a PiP, then:
+    dot -Tpng /tmp/dot/videomixer-playing.dot -o docs/example_pipeline.png
+
+`docs/videomix.uml` is the hand-maintained overview of the same graph with the
+queues elided:
+
+    plantuml docs/videomix.uml
 
 
 Running without Docker
