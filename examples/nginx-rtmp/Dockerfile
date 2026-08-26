@@ -43,9 +43,9 @@ FROM debian:trixie-slim
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/usr/local/nginx/sbin:$PATH
 
-# Only the shared libraries nginx actually links against.
+# Only the shared libraries nginx actually links against + curl for healthcheck
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libpcre2-8-0 zlib1g libssl3 ca-certificates \
+      libpcre2-8-0 zlib1g libssl3 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /usr/local/nginx /usr/local/nginx

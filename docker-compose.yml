@@ -11,7 +11,7 @@ services:
       - "1935:1935"   # RTMP
       - "8890:8890"   # /stat, /control, /health
     healthcheck:
-      test: ["CMD", "sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8890 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8890/health"]
       interval: 5s
       timeout: 3s
       retries: 10
