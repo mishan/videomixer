@@ -6,7 +6,20 @@ number of live RTMP inputs into a single H.264/AAC stream and pushes the result
 to an RTMP destination, with an HTTP API for adding, moving, resizing and
 removing picture-in-picture layers on a running stream.
 
-It started as a hackathon proof of concept. Video mixing worked; audio did not.
+It never got past proof of concept: video mixing worked, audio did not.
+
+
+Origins
+-------
+
+This project began in 2018 as a hackathon project at
+[The Meet Group](https://www.themeetgroup.com/), who open sourced it as
+`themeetgroup/videomixer`. It has since been detached from that repository and
+continues here.
+
+With thanks to The Meet Group for open sourcing it originally. The 2018 work
+remains copyright The Meet Group Inc and the project is still MIT licensed —
+see [LICENSE](LICENSE).
 
 
 Quick start
