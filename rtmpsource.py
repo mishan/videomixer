@@ -1,25 +1,48 @@
 #!/usr/bin/env python3
+"""A single RTMP input feeding a VideoMixer's compositor and audiomixer.
+
+Everything here is built dynamically. rtmp2src -> flvdemux exposes its audio
+and video pads only once the stream is actually flowing, and decodebin in turn
+exposes its decoded pads later still, so the chain is assembled from inside
+pad-added callbacks.
+
+Two rules matter and both were violated by the original implementation:
+
+1. Every pad a demuxer exposes must be consumed. An unlinked pad returns
+   GST_FLOW_NOT_LINKED, which propagates upstream and takes the entire
+   pipeline down with an opaque "Internal data stream error". Pads we have no
+   use for get a fakesink rather than being ignored.
+
+2. Elements added to an already-PLAYING pipeline start life in NULL state and
+   will never produce data until told otherwise. Every element added here is
+   followed by sync_state_with_parent(), which is what makes it possible to
+   add a PiP to a running stream.
+"""
+
+import logging
 
 import gi
 gi.require_version('Gst', '1.0')
-gi.require_version('GstBase', '1.0')
-from gi.repository import GObject, Gst, GstBase, GObject  # noqa: E402
+from gi.repository import Gst  # noqa: E402
+
+log = logging.getLogger(__name__)
+
+AUDIO_CAPS = 'audio/x-raw,rate=44100,channels=2,format=S16LE,layout=interleaved'
 
 
 class RtmpSource:
-    def __init__(self, location, pipeline, videomixer,
-                 audiomixer, xpos, ypos, zorder, width, height):
-        # RTMP stream location
+    # compositor zorder 0 is reserved for the mixer's always-black base layer,
+    # so every real source is shifted one step up. Callers keep using the
+    # documented scheme (background z=0, PiPs z>=1) and self.zorder always
+    # holds that caller-facing value.
+    ZORDER_OFFSET = 1
+
+    def __init__(self, location, pipeline, compositor, audiomixer,
+                 xpos=0, ypos=0, zorder=1, width=None, height=None):
         self.location = location
-        # GStreamer Pipeline to attach to
         self.pipeline = pipeline
-        # The videomixer to output to
-        self.videomixer = videomixer
-        # The audiomixer to output to
+        self.compositor = compositor
         self.audiomixer = audiomixer
-        # Not ready.
-        self.videomixer_sink = None
-        self.audiomixer_sink = None
 
         self.xpos = xpos
         self.ypos = ypos
@@ -27,221 +50,213 @@ class RtmpSource:
         self.width = width
         self.height = height
 
+        # Native dimensions, discovered from the decoded caps.
+        self.video_width = None
+        self.video_height = None
+
+        # Request pads we hold on the mixers, released on teardown.
+        self.compositor_pad = None
+        self.audiomixer_pad = None
+        # Every element we own, so removal is exact.
+        self.elements = []
+
         self.initialize()
 
+    # -- construction ------------------------------------------------------
+
+    def _make(self, factory, **props):
+        element = Gst.ElementFactory.make(factory, None)
+        if element is None:
+            raise RuntimeError(
+                'GStreamer element "{}" is unavailable -- is the matching '
+                'gst-plugins package installed?'.format(factory))
+        for key, value in props.items():
+            element.set_property(key.replace('_', '-'), value)
+        self.pipeline.add(element)
+        self.elements.append(element)
+        # Required when the pipeline is already running; harmless when it
+        # is not.
+        element.sync_state_with_parent()
+        return element
+
     def initialize(self):
-        # Create and hook up relevant objects
-        print("Creating RtmpSource objects")
+        log.info('Creating RTMP source for %s', self.location)
+        # rtmp2src supersedes the librtmp-based rtmpsrc, which fails with
+        # "Internal data stream error" against current RTMP servers.
+        self.rtmp_src = self._make('rtmp2src', location=self.location)
+        self.flvdemux = self._make('flvdemux')
+        self.flvdemux.connect('pad-added', self._on_demux_pad_added)
 
-        self.rtmp_src = Gst.ElementFactory.make("rtmpsrc")
-        self.rtmp_src.set_property("location", self.location)
-        self.pipeline.add(self.rtmp_src)
+        if not self.rtmp_src.link(self.flvdemux):
+            raise RuntimeError('Could not link rtmp2src -> flvdemux')
 
-        self.audio_queue = Gst.ElementFactory.make("queue")
-        self.video_queue = Gst.ElementFactory.make("queue")
-        self.flvdemux = Gst.ElementFactory.make("flvdemux")
-        # We listen for the pad-added event of flvdemux so that
-        # we can link the demuxed pads to the rest of the pipeline.
-        self.flvdemux.connect("pad-added", self.on_flvdemux_pad_added)
-        self.pipeline.add(self.flvdemux)
-        self.pipeline.add(self.video_queue)
-        self.pipeline.add(self.audio_queue)
+    # -- dynamic linking ---------------------------------------------------
 
-        self.audio_convert = Gst.ElementFactory.make("audioconvert")
-        self.pipeline.add(self.audio_convert)
-        self.audio_resample = Gst.ElementFactory.make("audioresample")
-        self.pipeline.add(self.audio_resample)
+    def _on_demux_pad_added(self, demux, pad):
+        caps = pad.get_current_caps()
+        pad_type = caps.get_structure(0).get_name() if caps else ''
+        log.info('[%s] demux pad %s (%s)', self.location, pad.get_name(),
+                 pad_type or 'unknown')
 
-        self.decodebin = Gst.ElementFactory.make("decodebin")
-        # We listen for the pad-added event of decodebin so that
-        # we can link the decoded video pad to the mixer sink.
-        self.decodebin.connect("pad-added", self.on_decode_video_pad_added)
-        self.pipeline.add(self.decodebin)
-
-        self.audio_decodebin = Gst.ElementFactory.make("decodebin")
-        # We listen for the pad-added event of decodebin so that
-        # we can link the decoded audio pad to the mixer sink.
-        self.audio_decodebin.connect("pad-added", self.on_decode_audio_pad_added)
-        self.pipeline.add(self.audio_decodebin)
-
-        self.videoscale = Gst.ElementFactory.make("videoscale")
-        self.pipeline.add(self.videoscale)
-
-        self.capsfilter = Gst.ElementFactory.make("capsfilter")
-        # Only change the width and height if they're set. Otherwise
-        # leave it unchanged. videoscale+capsfilter shouldn't do
-        # anything if there aren't any caps set.
-        if (self.width is not None and self.height is not None):
-            caps_string = self.get_caps_string(self.width, self.height)
-            self.vidcaps = Gst.Caps.from_string(caps_string)
-            self.capsfilter.set_property("caps", self.vidcaps)
-        self.pipeline.add(self.capsfilter)
-
-        # Link the RTMP source to the FLV demuxer
-        ret = self.rtmp_src.link(self.flvdemux)
-        # Link the video queue to the decodebin
-        ret = ret and self.video_queue.link(self.decodebin)
-        # Link the audio queue to the decodebin
-        ret = ret and self.audio_queue.link(self.audio_decodebin)
-
-        # Link the videoscaler to the capsfilter
-        ret = ret and self.videoscale.link(self.capsfilter)
-
-        # flvdemux should get audio and video pads from the rtmp_src.
-        # We cannot link the flvdemux module to decodebin. We must link it
-        # dynamically once the pads appear.
-        # We cannot link decodebin to videomixer, either. We must link it
-        # dynamically, after flvdemux is dynamically linked to decodebin and
-        # the pad appears in decodebin.
-
-        if not ret:
-            print("ERROR: Elements could not be linked.")
-            raise Exception("Could not link elements in RtmpSource")
-
-    def on_flvdemux_pad_added(self, src, new_pad):
-        # TODO: handle linking audio, too.
-        sink_pad = None
-        print(
-            "Received new pad '{0:s}' from '{1:s}'".format(
-                new_pad.get_name(),
-                src.get_name()))
-
-        # check the new pad's type
-        new_pad_caps = new_pad.get_current_caps()
-        new_pad_struct = new_pad_caps.get_structure(0)
-        new_pad_type = new_pad_struct.get_name()
-
-        if new_pad_type.startswith("audio"):
-            print("Got audio pad")
-            sink_pad = self.audio_queue.get_static_pad("sink")
-        elif new_pad_type.startswith("video"):
-            print("Got video pad")
-            sink_pad = self.video_queue.get_static_pad("sink")
+        if pad_type.startswith('video'):
+            sink_pad = self._build_video_branch()
+        elif pad_type.startswith('audio'):
+            sink_pad = self._build_audio_branch()
         else:
-            print("Type '{0:s}' which is not audio/video. Ignoring.".format(
-                new_pad_type))
+            # Rule 1: consume it anyway, or it stalls everything.
+            log.info('[%s] discarding unhandled pad type %s',
+                     self.location, pad_type)
+            sink_pad = self._make('fakesink', sync=False,
+                                  async_=False).get_static_pad('sink')
+
+        if sink_pad is None or sink_pad.is_linked():
+            return
+        result = pad.link(sink_pad)
+        if result != Gst.PadLinkReturn.OK:
+            log.error('[%s] failed to link demux pad %s: %s',
+                      self.location, pad.get_name(), result.value_nick)
+
+    def _build_video_branch(self):
+        queue = self._make('queue', max_size_time=2 * Gst.SECOND, leaky=2)
+        decodebin = self._make('decodebin')
+        decodebin.connect('pad-added', self._on_video_decoded)
+        # decodebin can also decide a stream is undecodable; make sure that
+        # does not leave a dangling pad.
+        decodebin.connect('no-more-pads', lambda *_: None)
+        if not queue.link(decodebin):
+            raise RuntimeError('Could not link video queue -> decodebin')
+        return queue.get_static_pad('sink')
+
+    def _build_audio_branch(self):
+        queue = self._make('queue', max_size_time=2 * Gst.SECOND, leaky=2)
+        decodebin = self._make('decodebin')
+        decodebin.connect('pad-added', self._on_audio_decoded)
+        if not queue.link(decodebin):
+            raise RuntimeError('Could not link audio queue -> decodebin')
+        return queue.get_static_pad('sink')
+
+    def _on_video_decoded(self, decodebin, pad):
+        caps = pad.get_current_caps()
+        if caps is None or not caps.get_structure(0).get_name().startswith('video'):
+            return
+        structure = caps.get_structure(0)
+        ok, self.video_width = structure.get_int('width')
+        ok, self.video_height = structure.get_int('height')
+        log.info('[%s] decoded video %sx%s', self.location,
+                 self.video_width, self.video_height)
+
+        convert = self._make('videoconvert')
+        scale = self._make('videoscale')
+        rate = self._make('videorate')
+
+        pad_template = self.compositor.get_pad_template('sink_%u')
+        self.compositor_pad = self.compositor.request_pad(pad_template,
+                                                          None, None)
+        if self.compositor_pad is None:
+            log.error('[%s] could not obtain a compositor sink pad',
+                      self.location)
             return
 
-        if sink_pad is None:
-            print("No sink_pad defined. Bailing out.")
+        self.compositor_pad.set_property('xpos', self.xpos)
+        self.compositor_pad.set_property('ypos', self.ypos)
+        self.compositor_pad.set_property('zorder',
+                                         self.zorder + self.ZORDER_OFFSET)
+        # compositor scales on the pad itself; 0 means "use the native size".
+        self.compositor_pad.set_property('width', self.width or 0)
+        self.compositor_pad.set_property('height', self.height or 0)
+
+        if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
+            log.error('[%s] could not link decoded video pad', self.location)
+            return
+        if not convert.link(scale) or not scale.link(rate):
+            log.error('[%s] could not link video conversion chain',
+                      self.location)
+            return
+        if rate.get_static_pad('src').link(self.compositor_pad) != Gst.PadLinkReturn.OK:
+            log.error('[%s] could not link into compositor', self.location)
+
+    def _on_audio_decoded(self, decodebin, pad):
+        caps = pad.get_current_caps()
+        if caps is None or not caps.get_structure(0).get_name().startswith('audio'):
+            return
+        log.info('[%s] decoded audio', self.location)
+
+        convert = self._make('audioconvert')
+        resample = self._make('audioresample')
+        capsfilter = self._make('capsfilter')
+        capsfilter.set_property('caps', Gst.Caps.from_string(AUDIO_CAPS))
+
+        pad_template = self.audiomixer.get_pad_template('sink_%u')
+        self.audiomixer_pad = self.audiomixer.request_pad(pad_template,
+                                                           None, None)
+        if self.audiomixer_pad is None:
+            log.error('[%s] could not obtain an audiomixer sink pad',
+                      self.location)
             return
 
-        if sink_pad.is_linked():
-            print("sink_pad is already linked")
+        if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
+            log.error('[%s] could not link decoded audio pad', self.location)
             return
-
-        ret = new_pad.link(sink_pad)
-        if not ret == Gst.PadLinkReturn.OK:
-            print("Link failed.")
+        if not convert.link(resample) or not resample.link(capsfilter):
+            log.error('[%s] could not link audio conversion chain',
+                      self.location)
             return
+        if capsfilter.get_static_pad('src').link(self.audiomixer_pad) != Gst.PadLinkReturn.OK:
+            log.error('[%s] could not link into audiomixer', self.location)
 
-        print("Linked {0:s} pad".format(new_pad.get_name()))
-
-    def on_decode_audio_pad_added(self, src, new_pad):
-        print(
-            "Received new audio decodebin pad '{0:s}' from '{1:s}'".format(
-                new_pad.get_name(),
-                src.get_name()))
-
-        # Get a sink pad from the audioconvert module
-        sink = self.audio_convert.get_static_pad("sink")
-
-        if (sink is None):
-            print("Could not get audioconvert sink!")
-            return
-
-        ret = new_pad.link(sink)
-        ret = ret and self.audio_convert.link(self.audio_resample)
-        ret = ret and self.audio_resample.link(self.audiomixer)
-
-        if ret is None:
-            print("Could not hook up new pad to audioconvert sink")
-            raise Exception("Failed to hook up decode sink to audioconvert / audiomixer")
-
-        return
-
-    def on_decode_video_pad_added(self, src, new_pad):
-        print(
-            "Received new video decodebin pad '{0:s}' from '{1:s}'".format(
-                new_pad.get_name(),
-                src.get_name()))
-
-        video_pad_caps = new_pad.get_current_caps()
-        caps0 = video_pad_caps.get_structure(0)
-        (ok, self.video_width) = caps0.get_int("width")
-        (ok, self.video_height) = caps0.get_int("height")
-
-        # Get the sink for the videoscale module and the "src" (output) from
-        # the capsfilter module.
-        scale_sink = self.videoscale.get_static_pad("sink")
-        filter_src = self.capsfilter.get_static_pad("src")
-
-        # Get a sink pad from the videomixer
-        pad_template = self.videomixer.get_pad_template("sink_%u")
-        sink = self.videomixer.request_pad(pad_template, None, None)
-
-        if (sink is None):
-            print("Could not get videomixer sink!")
-            return
-
-        # Set the sink position
-        sink.set_property("xpos", self.xpos)
-        sink.set_property("ypos", self.ypos)
-        # Set zorder (z-index)
-        sink.set_property("zorder", self.zorder)
-
-        # Link the decoder pad to the videoscale sink
-        # The videoscale module is hooked up to the capsfilter
-        # module already.
-        ret = new_pad.link(scale_sink)
-        # Link the capsfilter src to the videomixer sink
-        filter_src.link(sink)
-
-        if ret is None:
-            print("Could not hook up new pad to videomixer sink")
-            raise Exception("Failed to hook up decode sink to videomixer")
-
-        self.videomixer_sink = sink
+    # -- control -----------------------------------------------------------
 
     def move(self, xpos, ypos, zorder):
-        self.xpos = xpos
-        self.ypos = ypos
-        self.zorder = zorder
-
-        self.videomixer_sink.set_property("xpos", self.xpos)
-        self.videomixer_sink.set_property("ypos", self.ypos)
-        self.videomixer_sink.set_property("zorder", self.zorder)
+        self.xpos, self.ypos, self.zorder = xpos, ypos, zorder
+        if self.compositor_pad is None:
+            return
+        self.compositor_pad.set_property('xpos', xpos)
+        self.compositor_pad.set_property('ypos', ypos)
+        self.compositor_pad.set_property('zorder', zorder + self.ZORDER_OFFSET)
 
     def shift(self, xdiff, ydiff, zdiff=0):
-        self.xpos += xdiff
-        self.xpos %= self.video_width
-        self.ypos += ydiff
-        self.ypos %= self.video_height
-        self.zorder += zdiff
-
-        self.videomixer_sink.set_property("xpos", self.xpos)
-        self.videomixer_sink.set_property("ypos", self.ypos)
-        self.videomixer_sink.set_property("zorder", self.zorder)
+        width = self.video_width or 1
+        height = self.video_height or 1
+        self.move((self.xpos + xdiff) % width,
+                  (self.ypos + ydiff) % height,
+                  self.zorder + zdiff)
 
     def resize(self, width, height):
-        caps = Gst.Caps.from_string(self.get_caps_string(width, height))
-        self.capsfilter.set_property("caps", caps)
+        self.width, self.height = width, height
+        if self.compositor_pad is None:
+            return
+        self.compositor_pad.set_property('width', width or 0)
+        self.compositor_pad.set_property('height', height or 0)
 
-    def get_caps_string(self, width, height):
-        return "video/x-raw,width={},height={}".format(width, height)
+    def remove(self):
+        """Detach this source and free everything it owns."""
+        log.info('Removing RTMP source %s', self.location)
+        for element in self.elements:
+            element.set_state(Gst.State.NULL)
+        for element in self.elements:
+            self.pipeline.remove(element)
+        self.elements = []
+
+        if self.compositor_pad is not None:
+            self.compositor.release_request_pad(self.compositor_pad)
+            self.compositor_pad = None
+        if self.audiomixer_pad is not None:
+            self.audiomixer.release_request_pad(self.audiomixer_pad)
+            self.audiomixer_pad = None
 
     def get_info(self):
-        ret = {}
-        ret['orig_video'] = {
+        return {
             'location': self.location,
-            'width': self.video_width,
-            'height': self.video_height
+            'source': {
+                'width': self.video_width,
+                'height': self.video_height,
+            },
+            'video': {
+                'width': self.width,
+                'height': self.height,
+                'xpos': self.xpos,
+                'ypos': self.ypos,
+                'zorder': self.zorder,
+            },
+            'has_audio': self.audiomixer_pad is not None,
         }
-        ret['video'] = {
-            'width': self.width,
-            'height': self.height,
-            'xpos': self.xpos,
-            'ypos': self.ypos,
-            'zorder': self.zorder
-        }
-        return ret
