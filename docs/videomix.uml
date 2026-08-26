@@ -1,26 +1,69 @@
 @startuml
 
-package RtmpSource {
- node rtmpsrc
- node flvdemux
- node decodebin
- node videoscale
- node capsfilter
+' Element graph for one mixed output stream.
+'
+' Queues sit between most of these and are omitted for readability -- see
+' example_pipeline.png for the real thing, dumped straight out of GStreamer.
+'
+' Render with:  plantuml videomix.uml
+
+skinparam nodesep 15
+skinparam ranksep 30
+skinparam shadowing false
+
+package "RtmpSource (one per input)" {
+  node rtmp2src
+  node flvdemux
+  node "decodebin\n(video)" as vdecode
+  node "decodebin\n(audio)" as adecode
+  node videoconvert
+  node videoscale
+  node videorate
+  node audioconvert
+  node audioresample
+  node "capsfilter\n44.1kHz stereo" as srccaps
 }
 
-node videomixer
-node x264enc
-node flvmux
-node rtmpsink
+package "VideoMixer" {
+  node "videotestsrc\npattern=black\nis-live" as videobase
+  node "audiotestsrc\nwave=silence\nis-live" as audiobase
+  node compositor
+  node audiomixer
+  node x264enc
+  node h264parse
+  node avenc_aac
+  node aacparse
+  node flvmux
+  node rtmp2sink
+}
 
-rtmpsrc -> flvdemux
-flvdemux -> decodebin
-decodebin -> videoscale
-videoscale -> capsfilter
-capsfilter -> videomixer
+rtmp2src -> flvdemux
+flvdemux --> vdecode : video
+flvdemux --> adecode : audio
 
-videomixer -> x264enc
-x264enc -> flvmux
-flvmux -> rtmpsink
+vdecode -> videoconvert
+videoconvert -> videoscale
+videoscale -> videorate
+videorate --> compositor : "zorder N+1"
+
+adecode -> audioconvert
+audioconvert -> audioresample
+audioresample -> srccaps
+srccaps --> audiomixer
+
+' The base layers are load-bearing: flvmux emits nothing until every sink pad
+' has data, so both branches must always carry something.
+videobase --> compositor : "zorder 0"
+audiobase --> audiomixer
+
+compositor -> x264enc
+x264enc -> h264parse
+h264parse --> flvmux : video
+
+audiomixer -> avenc_aac
+avenc_aac -> aacparse
+aacparse --> flvmux : audio
+
+flvmux -> rtmp2sink
 
 @enduml

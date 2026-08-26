@@ -32,6 +32,7 @@ this project had before.
 """
 
 import logging
+import os
 
 import rtmpsource
 
@@ -72,9 +73,28 @@ class VideoMixer:
 
     # -- lifecycle ---------------------------------------------------------
 
+    def dump_dot(self, suffix):
+        """Write a Graphviz dump of the pipeline, if dumping is enabled.
+
+        Set GST_DEBUG_DUMP_DOT_DIR to a directory and every pipeline change
+        lands there as a .dot file; render one with::
+
+            dot -Tpng pipeline.dot -o pipeline.png
+
+        Unlike gst-launch, an application has to ask for these explicitly, so
+        this is called at the points worth inspecting. It is a no-op when the
+        environment variable is unset.
+        """
+        if not os.environ.get('GST_DEBUG_DUMP_DOT_DIR'):
+            return
+        name = 'videomixer-{}'.format(suffix)
+        Gst.debug_bin_to_dot_file(self.pipeline, Gst.DebugGraphDetails.ALL, name)
+        log.debug('Wrote pipeline graph %s.dot', name)
+
     def play(self):
         log.info('Starting pipeline -> %s', self.output_url)
         self.pipeline.set_state(Gst.State.PLAYING)
+        self.dump_dot('playing')
 
     def pause(self):
         log.info('Pausing pipeline -> %s', self.output_url)
@@ -104,6 +124,7 @@ class VideoMixer:
                                        self.compositor, self.audiomixer,
                                        xpos, ypos, zorder, width, height)
         self.sources[pip_id] = source
+        self.dump_dot('source-{}'.format(pip_id))
         return source
 
     def remove_rtmp_source(self, pip_id):

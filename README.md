@@ -187,12 +187,42 @@ Development
 | `down` | stop the stack and remove volumes           |
 | `logs` | follow the container logs                   |
 
-Lint dependencies live in `requirements-dev.txt`, not `requirements.txt` — the
+Dev dependencies live in `requirements-dev.txt`, not `requirements.txt` — the
 latter is what the Dockerfile installs, and a linter has no business in the
 runtime image.
 
     pip install -r requirements-dev.txt
-    make lint
+    make check
+
+### Tests
+
+`tests/` runs in well under a second and needs no Docker, no network and no
+RTMP server. `rtmp2sink` only connects on the transition out of NULL, so a
+pipeline can be fully constructed and asserted on without anything opening a
+socket.
+
+They deliberately use real GStreamer rather than mocking it. Every serious bug
+this project had — an encoder silently rejecting caps, an audio branch that
+never reached the muxer, a base layer occluding the background — lived in the
+wiring, and a mock of `Gst` would have accepted all of them. `test_pipeline.py`
+asserts those invariants directly; `test_api.py` covers routing, validation and
+status codes against a fake mixer, including that every handler is a coroutine.
+
+### Regenerating the diagrams
+
+`docs/example_pipeline.png` is a Graphviz dump of a real running pipeline, not
+a hand-drawn picture. Set `GST_DEBUG_DUMP_DOT_DIR` and the mixer writes one on
+every pipeline change (`VideoMixer.dump_dot`); unlike `gst-launch`, an
+application has to ask for these explicitly.
+
+    GST_DEBUG_DUMP_DOT_DIR=/tmp/dot python3 mix.py
+    # create a stream and add a PiP, then:
+    dot -Tpng /tmp/dot/videomixer-playing.dot -o docs/example_pipeline.png
+
+`docs/videomix.uml` is the hand-maintained overview of the same graph with the
+queues elided:
+
+    plantuml docs/videomix.uml
 
 
 Running without Docker
