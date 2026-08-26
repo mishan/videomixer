@@ -196,8 +196,21 @@ class VideoMixer:
 
         # The audio equivalent of the black layer: silence that never stops.
         # Without this, a source with no audio track starves flvmux forever.
+        #
+        # is-live MUST stay false here, unlike the video base layer above.
+        # A live source puts audiomixer into clock-driven mode, where it emits
+        # a fixed output window per clock tick and discards anything that does
+        # not fall inside it. RTMP sources are not live, so their decoded audio
+        # lands outside that window and gets dropped -- the mix comes out as
+        # pure digital silence even though the audio decoded correctly.
+        # Non-live, the aggregator instead waits for all pads, and flvmux keeps
+        # the whole branch paced against video.
+        #
+        # compositor does not have this problem because it repeats the last
+        # buffer on a pad that has no new data, which is why the video base
+        # layer can stay live and give an empty stream real-time black output.
         self.audio_base = self._make('audiotestsrc', 'audiobase',
-                                     wave='silence', is_live=True)
+                                     wave='silence', is_live=False)
         silence_caps = self._make('capsfilter', 'silencecaps')
         silence_caps.set_property('caps', Gst.Caps.from_string(AUDIO_CAPS))
 

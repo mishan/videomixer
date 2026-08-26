@@ -123,10 +123,31 @@ Two things fed that:
   servers, with the same unhelpful error.
 
 So: `rtmp2src` replaces `rtmpsrc`, every demuxer pad is consumed (unused ones
-get a `fakesink` rather than being ignored), and the always-live black/silent
-base layers guarantee the muxer is never starved on either branch. Elements
-added to a running pipeline also get `sync_state_with_parent()`, without which
-a newly added PiP sits in NULL state and silently produces nothing.
+get a `fakesink` rather than being ignored), and the black/silent base layers
+guarantee the muxer is never starved on either branch. Elements added to a
+running pipeline also get `sync_state_with_parent()`, without which a newly
+added PiP sits in NULL state and silently produces nothing.
+
+### The base layers differ on `is-live`, and it matters
+
+The black video layer is live; the silent audio layer is **not**. This looks
+inconsistent and is deliberate.
+
+A live source puts `audiomixer` into clock-driven mode, where it emits one
+output window per clock tick and discards anything that does not fall inside
+it. RTMP sources are not live, so their decoded audio lands outside that
+window and is dropped — the mix comes out as pure digital silence even though
+the audio decoded without a single error in the log. Non-live, the aggregator
+waits for all pads instead, and `flvmux` keeps the audio branch paced against
+video.
+
+`compositor` does not have this problem because it repeats the last buffer on
+a pad with no new data, so the video base layer can stay live and give an
+empty stream real-time black output.
+
+If the mix ever goes silent again while the logs look clean, this is the first
+thing to check. `scripts/test_e2e.sh` asserts on mean volume specifically to
+catch it.
 
 
 Other things that changed
