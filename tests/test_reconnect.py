@@ -17,7 +17,24 @@ from gi.repository import Gst, GLib  # noqa: E402
 
 import rtmpsource  # noqa: E402
 
-from conftest import DEAD_RTMP_URL  # noqa: E402
+from conftest import DEAD_RTMP_URL, gst_list  # noqa: E402
+
+
+def simulate_stream_arriving(mixer, source):
+    """Stand in for the mixer pads that only appear once data is decoded.
+
+    Nothing is publishing in a unit test, so _on_video_decoded never fires and
+    the request pads a real source would hold are never taken. Flapping is
+    precisely about acquiring and releasing those pads repeatedly, so they have
+    to exist for the test to mean anything.
+    """
+    video_template = mixer.compositor.get_pad_template('sink_%u')
+    source.compositor_pad = mixer.compositor.request_pad(
+        video_template, None, None)
+    audio_template = mixer.audiomixer.get_pad_template('sink_%u')
+    source.audiomixer_pad = mixer.audiomixer.request_pad(
+        audio_template, None, None)
+    source._mark_connected()
 
 
 @pytest.fixture
@@ -170,6 +187,99 @@ def test_connection_state_is_reported(source, scheduler):
     assert connection['state'] == rtmpsource.RECONNECTING
     assert connection['reconnect_attempts'] == 1
     assert connection['last_error'] == 'publisher ended the stream'
+
+
+class TestFlapping:
+    """A source that keeps dropping and coming back every few seconds.
+
+    Each cycle takes and gives back a request pad on both mixers and rebuilds
+    the whole element chain, so this is where leaks would show up: pads that
+    are never released accumulate silently and the compositor keeps compositing
+    layers that no longer have a source behind them.
+    """
+
+    FLAPS = 15
+
+    def _flap_once(self, mixer, source, scheduler):
+        simulate_stream_arriving(mixer, source)
+        source.handle_disconnect('publisher ended the stream')
+        scheduler.fire_last()
+
+    def test_compositor_pads_do_not_accumulate(self, mixer, source, scheduler):
+        # One sink pad for the black base layer, plus one per live source.
+        base_pads = len(gst_list(mixer.compositor.iterate_sink_pads()))
+        for _ in range(self.FLAPS):
+            self._flap_once(mixer, source, scheduler)
+            assert len(gst_list(mixer.compositor.iterate_sink_pads())) == base_pads, \
+                'a compositor pad was left behind by a reconnect'
+
+    def test_audiomixer_pads_do_not_accumulate(self, mixer, source, scheduler):
+        base_pads = len(gst_list(mixer.audiomixer.iterate_sink_pads()))
+        for _ in range(self.FLAPS):
+            self._flap_once(mixer, source, scheduler)
+            assert len(gst_list(mixer.audiomixer.iterate_sink_pads())) == base_pads, \
+                'an audiomixer pad was left behind by a reconnect'
+
+    def test_pipeline_element_count_is_stable(self, mixer, source, scheduler):
+        self._flap_once(mixer, source, scheduler)
+        settled = len(gst_list(mixer.pipeline.iterate_elements()))
+        for _ in range(self.FLAPS):
+            self._flap_once(mixer, source, scheduler)
+        assert len(gst_list(mixer.pipeline.iterate_elements())) == settled, \
+            'elements are accumulating in the pipeline across reconnects'
+
+    def test_only_one_retry_is_ever_pending(self, mixer, source, scheduler):
+        """Overlapping timers would compound into a storm of attempts."""
+        for _ in range(self.FLAPS):
+            simulate_stream_arriving(mixer, source)
+            before = len(scheduler.timers)
+            source.handle_disconnect('flap')
+            # A second disconnect before the retry fires must not double-arm.
+            source.handle_disconnect('flap again')
+            assert len(scheduler.timers) == before + 1
+            scheduler.fire_last()
+
+    def test_backoff_restarts_after_each_successful_connection(
+            self, mixer, source, scheduler):
+        """A flap is a fresh outage, not a continuation of the last one.
+
+        Backing off further every time would mean a source that recovers
+        cleanly each cycle drifts towards 30s of black for no reason.
+        """
+        for _ in range(5):
+            simulate_stream_arriving(mixer, source)
+            assert source.reconnect_attempts == 0
+            source.handle_disconnect('flap')
+            assert scheduler.delays[-1] == 1
+            scheduler.fire_last()
+
+    def test_source_stays_usable_after_sustained_flapping(
+            self, mixer, source, scheduler):
+        for _ in range(self.FLAPS):
+            self._flap_once(mixer, source, scheduler)
+        simulate_stream_arriving(mixer, source)
+        assert source.state == rtmpsource.CONNECTED
+        assert source.reconnect_attempts == 0
+        assert source.last_error is None
+        assert source.elements, 'source ended up with no elements'
+        assert source.get_info()['video']['xpos'] == 10
+
+    def test_removal_mid_flap_leaves_nothing_behind(
+            self, mixer, source, scheduler):
+        # Measured with the source down, so this is the base layers alone.
+        base_video = len(gst_list(mixer.compositor.iterate_sink_pads()))
+        base_audio = len(gst_list(mixer.audiomixer.iterate_sink_pads()))
+        for _ in range(5):
+            self._flap_once(mixer, source, scheduler)
+
+        simulate_stream_arriving(mixer, source)
+        assert len(gst_list(mixer.compositor.iterate_sink_pads())) == base_video + 1
+        assert len(gst_list(mixer.audiomixer.iterate_sink_pads())) == base_audio + 1
+
+        source.remove()
+        assert len(gst_list(mixer.compositor.iterate_sink_pads())) == base_video
+        assert len(gst_list(mixer.audiomixer.iterate_sink_pads())) == base_audio
+        assert source.elements == []
 
 
 class TestEosProbe:

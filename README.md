@@ -304,6 +304,9 @@ Known gaps
 
 * Audio focus, ducking and normalization are not implemented — every source is
   mixed at unity gain.
-* Reconnection is verified against a publisher that goes away cleanly and one
-  that never returns. A flapping source that reconnects every few seconds is
-  untested.
+* Recovery latency is bounded by the backoff cap. Once a source is reachable
+  again it can take up to `RECONNECT_MAX_DELAY` (30s) to be picked up, and a
+  source that flaps faster than the current delay — up for a few seconds at a
+  time — can be missed for several cycles, because each retry lands in a gap.
+  It always recovers once the source stays up; it just may not catch a brief
+  window. Lower the cap if fast recovery matters more than connection load.
