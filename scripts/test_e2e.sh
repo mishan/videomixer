@@ -48,11 +48,18 @@ publish() {  # publish <name> <tone-hz> <size> <pattern>
 }
 
 say "Waiting for the mixer API"
+# Both halves of this loop have to stay inside `if`: under set -e a bare
+# `cmd && break` or `[ x = y ] && ...` aborts the script the moment the test
+# is false, which would make a slow-starting API look like a hard failure.
+ready=
 for i in $(seq 30); do
-    curl -sf "$API/health" >/dev/null && break
-    [ "$i" = 30 ] && fail "API never came up at $API"
+    if curl -sf "$API/health" >/dev/null 2>&1; then
+        ready=yes
+        break
+    fi
     sleep 1
 done
+[ -n "$ready" ] || fail "API never came up at $API"
 pass "API is healthy"
 
 say "Publishing source streams"
@@ -66,7 +73,9 @@ curl -sf -H 'Content-Type: application/json' -X PUT \
     -d "{\"bg_uri\":\"$RTMP_NET_URL/testpattern\",
          \"output_uri\":\"$RTMP_NET_URL/mixed\",
          \"width\":640,\"height\":360}" \
-    "$API/stream/$STREAM_ID" | tee "$WORKDIR/create.json"
+    "$API/stream/$STREAM_ID" >"$WORKDIR/create.json" \
+    || fail "create request failed -- is the mixer reachable at $API?"
+sed 's/^/  /' "$WORKDIR/create.json"; echo
 grep -q '"status": "OK"' "$WORKDIR/create.json" || fail "could not create stream"
 pass "stream created"
 sleep 5
@@ -75,7 +84,9 @@ say "Adding a picture-in-picture to the running stream"
 curl -sf -H 'Content-Type: application/json' -X PUT \
     -d "{\"stream_uri\":\"$RTMP_NET_URL/cam\",
          \"x\":400,\"y\":220,\"z\":10,\"width\":200,\"height\":112}" \
-    "$API/stream/$STREAM_ID/cam1" | tee "$WORKDIR/pip.json"
+    "$API/stream/$STREAM_ID/cam1" >"$WORKDIR/pip.json" \
+    || fail "PiP request failed"
+sed 's/^/  /' "$WORKDIR/pip.json"; echo
 grep -q '"status": "OK"' "$WORKDIR/pip.json" || fail "could not add PiP"
 pass "PiP added without restarting the pipeline"
 sleep 8
@@ -99,8 +110,12 @@ pass "H.264 video present"
 echo "$probe" | grep -q '^aac,audio'  || fail "no AAC audio track"
 pass "AAC audio present"
 
-mean=$(ffmpeg -nostdin -v error -i "$WORKDIR/mixed.flv" -af volumedetect \
-       -f null /dev/null 2>&1 | grep -oE 'mean_volume: [-0-9.]+' | cut -d' ' -f2)
+# volumedetect reports at ffmpeg's "info" level, so -v error would suppress
+# the very line being grepped for. The || true keeps a missing match from
+# taking the script down via set -e / pipefail.
+mean=$(ffmpeg -nostdin -v info -i "$WORKDIR/mixed.flv" -af volumedetect \
+       -f null /dev/null 2>&1 | grep -oE 'mean_volume: [-0-9.]+' \
+       | cut -d' ' -f2 || true)
 if [ -n "$mean" ]; then
     # Digital silence reports about -91 dB, so anything below -80 means the
     # audio track exists but carries nothing.
