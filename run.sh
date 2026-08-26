@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
+# Bring up the RTMP server and the mixer together.
 set -xue
 
-./build.sh
-
-docker kill videomixer || true
-docker rm videomixer || true
-
-docker run -d \
-       -p 8888:8888 \
-       --name videomixer \
-       -t videomixer-image
+docker compose up --build -d
+docker compose ps

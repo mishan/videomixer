@@ -1,0 +1,33 @@
+# Brings up the RTMP server and the mixer together.
+#
+#   docker compose up --build -d
+#   ./scripts/test_e2e.sh
+#
+services:
+  rtmp:
+    build: ./examples/nginx-rtmp
+    container_name: videomixer-rtmp
+    ports:
+      - "1935:1935"   # RTMP
+      - "8890:8890"   # /stat, /control, /health
+    healthcheck:
+      test: ["CMD", "sh", "-c", "exec 3<>/dev/tcp/127.0.0.1/8890 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q 200"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  videomixer:
+    build: .
+    container_name: videomixer
+    ports:
+      - "8888:8888"   # HTTP control API
+    environment:
+      MIX_LOG_LEVEL: INFO
+      # Raise to 3+ to get GStreamer's own debug output in the logs.
+      GST_DEBUG_LEVEL: "0"
+    depends_on:
+      rtmp:
+        condition: service_healthy
+    restart: unless-stopped
