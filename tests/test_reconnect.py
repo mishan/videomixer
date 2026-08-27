@@ -449,6 +449,81 @@ class TestRemovalRacingAReconnect:
         assert len(gst_list(mixer.compositor.iterate_sink_pads())) == video - 1
 
 
+class TestOwnershipUnderConcurrency:
+    """Attribution runs on the bus watch thread while sources are torn down.
+
+    _source_for reads element ownership to route an error back to the source it
+    came from. Teardown happens on other threads, so the query has to be taken
+    under the source's lock rather than reading the list directly.
+    """
+
+    def test_owns_tracks_the_current_elements(self, source):
+        assert source.owns(source.rtmp_src)
+        assert source.owns(source.flvdemux)
+        assert not source.owns(Gst.ElementFactory.make('identity', None))
+
+    def test_ownership_is_dropped_with_the_elements(self, source, scheduler):
+        orphan = source.rtmp_src
+        source.handle_disconnect('gone')
+        assert not source.owns(orphan), 'torn-down elements still claimed'
+
+    def test_a_dropped_attribution_cannot_strand_a_source(self, source,
+                                                          scheduler):
+        """Why an unattributed error during teardown is harmless.
+
+        Every path that empties the element list sets _closed or _rebuilding
+        first, and handle_disconnect returns early on both -- so routing an
+        error in that window would be a no-op regardless. The armed retry is
+        what recovers the source, and it is untouched.
+        """
+        source.handle_disconnect('publisher gone')
+        armed = len(scheduler.timers)
+        assert armed == 1
+
+        # Deliver the error that attribution would have dropped.
+        source.handle_disconnect('error from an orphaned element')
+        assert len(scheduler.timers) == armed, \
+            'routing during teardown should be a no-op, not a second retry'
+
+        scheduler.fire_last()
+        assert source.elements, 'the armed retry still rebuilt the source'
+
+    def test_attribution_holds_up_against_a_flapping_source(self, mixer,
+                                                            source, scheduler):
+        """Hammer the bus-watch path while the source tears down and rebuilds.
+
+        Reading source.elements directly is not memory-unsafe in CPython, so
+        this is really guarding against misattribution and against anything
+        that iterates while another thread mutates.
+        """
+        import threading
+
+        errors = []
+        stop = threading.Event()
+
+        def attribute():
+            try:
+                while not stop.is_set():
+                    found = mixer._source_for(source.rtmp_src)
+                    assert found in (None, source), 'attributed to the wrong source'
+                    mixer._source_for(mixer.x264enc) is None
+            except Exception as exc:            # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        reader = threading.Thread(target=attribute)
+        reader.start()
+        try:
+            for _ in range(60):
+                source.handle_disconnect('flap')
+                scheduler.fire_last()
+        finally:
+            stop.set()
+            reader.join(timeout=10)
+
+        assert not reader.is_alive(), 'attribution thread hung'
+        assert errors == [], 'attribution raised: {}'.format(errors)
+
+
 class TestEosProbe:
     """EOS on the source pad is the only signal a publisher has gone."""
 

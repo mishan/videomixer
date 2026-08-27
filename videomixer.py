@@ -295,8 +295,11 @@ class VideoMixer:
         until something matches a source's element list.
         """
         while obj is not None:
+            # Snapshot the sources: the API adds and removes them from the
+            # aiohttp thread while this runs on the bus watch thread. Ownership
+            # itself is queried under each source's own lock.
             for source in list(self.sources.values()):
-                if obj in source.elements:
+                if source.owns(obj):
                     return source
             obj = obj.get_parent()
         return None

@@ -298,6 +298,22 @@ class RtmpSource:
             return Gst.PadProbeReturn.DROP
         return Gst.PadProbeReturn.OK
 
+    def owns(self, element):
+        """Whether this element belongs to the source.
+
+        Read under the lock because the caller is the bus watch thread, while
+        a teardown on another thread may be swapping the element list out from
+        under it.
+
+        A stale answer here is not currently dangerous: every path that empties
+        the list sets _closed or _rebuilding first, and handle_disconnect
+        returns early on both, so an error that failed to be attributed would
+        have been a no-op anyway. That is a coincidence between two modules
+        rather than a design, though, so it is not worth relying on.
+        """
+        with self._lock:
+            return element in self.elements
+
     def _mark_connected(self):
         with self._lock:
             if self.state == CONNECTED:
