@@ -385,27 +385,49 @@ class RtmpSource:
             self._schedule_reconnect()
             return GLib.SOURCE_REMOVE
 
-        # The elements exist again, but nothing has arrived yet. Releasing the
-        # guard here is what lets the next failure -- a refused connection
-        # because the publisher is still away -- arm the following attempt.
         with self._lock:
-            self._rebuilding = False
+            # remove() may have run while initialize() was building. It cancels
+            # a pending timer, but it cannot cancel this callback once it is
+            # already executing, and it could only tear down the elements that
+            # existed at the moment it ran -- so anything built since is ours
+            # to clean up.
+            abandoned = self._closed
+            if not abandoned:
+                # The elements exist again but nothing has arrived yet. Dropping
+                # the guard here is what lets the next failure -- a refused
+                # connection because the publisher is still away -- arm the
+                # following attempt.
+                self._rebuilding = False
+
+        if abandoned:
+            log.info('[%s] removed while reconnecting, discarding the '
+                     'rebuilt elements', self.location)
+            self._teardown_elements()
         return GLib.SOURCE_REMOVE
 
     def _teardown_elements(self):
-        """Drop every element and mixer pad, leaving the source rebuildable."""
-        for element in self.elements:
-            element.set_state(Gst.State.NULL)
-        for element in self.elements:
-            self.pipeline.remove(element)
-        self.elements = []
+        """Drop every element and mixer pad, leaving the source rebuildable.
 
-        if self.compositor_pad is not None:
-            self.compositor.release_request_pad(self.compositor_pad)
-            self.compositor_pad = None
-        if self.audiomixer_pad is not None:
-            self.audiomixer.release_request_pad(self.audiomixer_pad)
-            self.audiomixer_pad = None
+        What to destroy is claimed under the lock and only then acted on, so
+        two callers racing -- the API removing a source while a reconnect tears
+        the old one down -- cannot both release the same pad or remove the same
+        element from the pipeline. Whoever loses gets an empty list.
+        """
+        with self._lock:
+            elements = self.elements
+            self.elements = []
+            compositor_pad, self.compositor_pad = self.compositor_pad, None
+            audiomixer_pad, self.audiomixer_pad = self.audiomixer_pad, None
+
+        for element in elements:
+            element.set_state(Gst.State.NULL)
+        for element in elements:
+            self.pipeline.remove(element)
+
+        if compositor_pad is not None:
+            self.compositor.release_request_pad(compositor_pad)
+        if audiomixer_pad is not None:
+            self.audiomixer.release_request_pad(audiomixer_pad)
 
     # -- control -----------------------------------------------------------
 

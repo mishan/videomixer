@@ -346,6 +346,109 @@ class TestFlapping:
         assert source.elements == []
 
 
+class TestRemovalRacingAReconnect:
+    """remove() cannot cancel a retry that is already executing.
+
+    It clears the pending timer, but a callback already running carries on,
+    and it can only tear down the elements that existed at the moment it ran.
+    Anything the retry builds afterwards belongs to a source nobody will ever
+    remove again, so the retry has to clean up after itself.
+    """
+
+    def _remove_as_the_retry_starts(self, source):
+        """Remove the source just after the retry passes its _closed check.
+
+        This is the interleaving that actually leaks. initialize() then runs
+        start to finish and succeeds, leaving a complete set of elements
+        attached to a source nobody will ever remove again.
+        """
+        original = source.initialize
+
+        def initialize():
+            source.remove()
+            return original()
+
+        source.initialize = initialize
+
+    def _remove_midway_through_initialize(self, source, after=1):
+        """Remove the source while initialize() is partway through building.
+
+        Distinct from the above: rtmp2src has already been pulled out of the
+        pipeline, so the link that follows fails and the error path cleans up.
+        Worth covering so that path stays correct, but it is not the leak.
+        """
+        original = source._make
+        state = {'made': 0}
+
+        def make(*args, **kwargs):
+            element = original(*args, **kwargs)
+            state['made'] += 1
+            if state['made'] == after:
+                source.remove()
+            return element
+
+        source._make = make
+        return state
+
+    def test_elements_built_after_removal_are_discarded(self, source, scheduler):
+        source.handle_disconnect('gone')
+        self._remove_as_the_retry_starts(source)
+        scheduler.fire_last()
+        assert source.elements == [], \
+            'reconnect left elements behind for a removed source'
+
+    def test_removal_midway_through_a_rebuild_also_cleans_up(self, source,
+                                                             scheduler):
+        source.handle_disconnect('gone')
+        self._remove_midway_through_initialize(source)
+        scheduler.fire_last()
+        assert source.elements == []
+
+    def test_pipeline_is_left_clean(self, mixer, source, scheduler):
+        source.handle_disconnect('gone')
+        # Baseline with the source torn down; an abandoned retry must not add
+        # anything back on top of it.
+        torn_down = len(gst_list(mixer.pipeline.iterate_elements()))
+        self._remove_as_the_retry_starts(source)
+        scheduler.fire_last()
+        assert len(gst_list(mixer.pipeline.iterate_elements())) == torn_down, \
+            'elements from an abandoned reconnect are still in the pipeline'
+
+    def test_mixer_pads_are_not_left_behind(self, mixer, source, scheduler):
+        simulate_stream_arriving(mixer, source)
+        video = len(gst_list(mixer.compositor.iterate_sink_pads()))
+        audio = len(gst_list(mixer.audiomixer.iterate_sink_pads()))
+        source.handle_disconnect('gone')
+        self._remove_as_the_retry_starts(source)
+        scheduler.fire_last()
+        assert len(gst_list(mixer.compositor.iterate_sink_pads())) == video - 1
+        assert len(gst_list(mixer.audiomixer.iterate_sink_pads())) == audio - 1
+
+    def test_no_further_retry_is_armed(self, source, scheduler):
+        source.handle_disconnect('gone')
+        armed = len(scheduler.timers)
+        self._remove_as_the_retry_starts(source)
+        scheduler.fire_last()
+        assert len(scheduler.timers) == armed, \
+            'a removed source armed another retry'
+
+    def test_teardown_is_safe_to_run_concurrently(self, mixer, source):
+        """Two callers must not both release the same pad or element.
+
+        The state is claimed under the lock, so the loser gets an empty list
+        rather than double-freeing what the winner already destroyed.
+        """
+        simulate_stream_arriving(mixer, source)
+        video = len(gst_list(mixer.compositor.iterate_sink_pads()))
+        source._teardown_elements()
+        source._teardown_elements()   # would double-release without the lock
+        source._teardown_elements()
+        assert source.elements == []
+        assert source.compositor_pad is None
+        assert source.audiomixer_pad is None
+        assert len(gst_list(mixer.compositor.iterate_sink_pads())) == video - 1
+
+
 class TestEosProbe:
     """EOS on the source pad is the only signal a publisher has gone."""
 
