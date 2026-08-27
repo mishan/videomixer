@@ -288,10 +288,34 @@ class VideoMixer:
         self.bus_watch_id = bus.add_watch(GLib.PRIORITY_DEFAULT,
                                           self._on_bus_message, None)
 
+    def _source_for(self, obj):
+        """Find the source that owns the element a message came from.
+
+        Errors often originate inside a decodebin, so walk up the parents
+        until something matches a source's element list.
+        """
+        while obj is not None:
+            # Snapshot the sources: the API adds and removes them from the
+            # aiohttp thread while this runs on the bus watch thread. Ownership
+            # itself is queried under each source's own lock.
+            for source in list(self.sources.values()):
+                if source.owns(obj):
+                    return source
+            obj = obj.get_parent()
+        return None
+
     def _on_bus_message(self, bus, message, _data):
         t = message.type
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
+            # An error from a source's own elements means that input died --
+            # a refused connection, or the idle timeout expiring on a
+            # half-open one. Hand it to the source so it reconnects rather
+            # than leaving the layer black forever.
+            source = self._source_for(message.src)
+            if source is not None:
+                source.handle_disconnect(err.message)
+                return True
             log.error('[%s] %s (from %s)', self.output_url, err.message,
                       message.src.get_name())
             if debug:
