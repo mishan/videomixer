@@ -116,7 +116,7 @@ def test_get_info_reports_state_and_geometry(mixer):
     assert info['width'] == 320
     assert info['height'] == 180
     assert info['state'] == 'null'
-    assert info['pip_streams'] == {}
+    assert info['sources'] == {}
 
 
 class TestSources:
@@ -126,7 +126,7 @@ class TestSources:
         with pytest.raises(ValueError):
             mixer.add_rtmp_source('bg', DEAD_RTMP_URL)
 
-    def test_unknown_pip_id_raises(self, mixer):
+    def test_unknown_source_id_raises(self, mixer):
         with pytest.raises(KeyError):
             mixer.resize_rtmp_source('nope', 10, 10)
         with pytest.raises(KeyError):
@@ -148,11 +148,12 @@ class TestSources:
         assert after < before, 'remove() left its elements in the pipeline'
 
     def test_geometry_is_recorded_before_any_data_arrives(self, mixer):
-        source = mixer.add_rtmp_source('pip', DEAD_RTMP_URL, xpos=20, ypos=30,
+        source = mixer.add_rtmp_source('cam', DEAD_RTMP_URL, xpos=20, ypos=30,
                                        zorder=5, width=160, height=90)
         info = source.get_info()
         assert info['video'] == {'width': 160, 'height': 90,
-                                 'xpos': 20, 'ypos': 30, 'zorder': 5}
+                                 'xpos': 20, 'ypos': 30, 'zorder': 5,
+                                 'fit': 'contain', 'alpha': 1.0}
         # No stream, so nothing has been decoded and no audio pad exists yet.
         assert info['has_audio'] is False
         assert info['source'] == {'width': None, 'height': None}
@@ -162,7 +163,7 @@ class TestZOrder:
     """zorder 0 is reserved for the base layer, so sources shift up by one."""
 
     def _source_with_pad(self, mixer):
-        source = mixer.add_rtmp_source('pip', DEAD_RTMP_URL, zorder=1)
+        source = mixer.add_rtmp_source('cam', DEAD_RTMP_URL, zorder=1)
         template = mixer.compositor.get_pad_template('sink_%u')
         source.compositor_pad = mixer.compositor.request_pad(template, None, None)
         return source
@@ -197,7 +198,7 @@ class TestZOrder:
 
 def test_move_before_video_arrives_does_not_crash(mixer):
     """The API can be called before a source has decoded anything."""
-    source = mixer.add_rtmp_source('pip', DEAD_RTMP_URL)
+    source = mixer.add_rtmp_source('cam', DEAD_RTMP_URL)
     assert source.compositor_pad is None
     source.move(1, 2, 3)
     source.resize(10, 20)
@@ -210,3 +211,137 @@ def test_missing_element_raises_a_useful_error(mixer, monkeypatch):
                         staticmethod(lambda *a, **k: None))
     with pytest.raises(RuntimeError, match='unavailable'):
         videomixer.VideoMixer(DEAD_RTMP_URL)
+
+
+class TestLayout:
+    """Layouts as the mixer applies them.
+
+    The arithmetic itself is covered in test_layout.py; what matters here is
+    that the numbers reach the sources, that the layout is re-resolved when the
+    set of sources changes, and that a layout never wins an argument with the
+    operator.
+    """
+
+    def _with_pad(self, mixer, source_id, **kwargs):
+        """A source holding a compositor pad, as it would after decoding."""
+        source = mixer.add_rtmp_source(source_id, DEAD_RTMP_URL, **kwargs)
+        template = mixer.compositor.get_pad_template('sink_%u')
+        source.compositor_pad = mixer.compositor.request_pad(template,
+                                                             None, None)
+        source._apply_geometry()
+        return source
+
+    def test_a_layout_places_every_source(self, mixer):
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        mixer.add_rtmp_source('b', DEAD_RTMP_URL)
+        mixer.set_layout({'preset': 'row'})
+        a, b = mixer.sources['a'], mixer.sources['b']
+        # The mixer fixture is 320x180.
+        assert (a.xpos, a.width) == (0, 160)
+        assert (b.xpos, b.width) == (160, 160)
+        assert a.height == b.height == 180
+
+    def test_a_joining_source_reshapes_the_grid(self, mixer):
+        """The point of tracking the spec rather than the rectangles."""
+        mixer.set_layout({'preset': 'grid'})
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        assert mixer.sources['a'].width == 320
+        mixer.add_rtmp_source('b', DEAD_RTMP_URL)
+        assert mixer.sources['a'].width == 160
+        assert mixer.sources['b'].xpos == 160
+
+    def test_a_leaving_source_closes_the_gap(self, mixer):
+        mixer.set_layout({'preset': 'row'})
+        for source_id in ('a', 'b', 'c'):
+            mixer.add_rtmp_source(source_id, DEAD_RTMP_URL)
+        mixer.remove_rtmp_source('b')
+        assert mixer.sources['a'].width == 160
+        assert mixer.sources['c'].xpos == 160
+
+    def test_geometry_reaches_the_compositor_pad(self, mixer):
+        source = self._with_pad(mixer, 'a')
+        mixer.set_layout({'preset': 'solo', 'fit': 'fill'})
+        pad = source.compositor_pad
+        assert (pad.get_property('width'), pad.get_property('height')) == (320, 180)
+        assert pad.get_property('sizing-policy').value_nick == 'none'
+        assert pad.get_property('alpha') == 1.0
+
+    def test_contain_keeps_the_aspect_ratio(self, mixer):
+        """A 16:9 camera in a square cell letterboxes instead of stretching."""
+        source = self._with_pad(mixer, 'a')
+        mixer.set_layout({'preset': 'grid'})
+        policy = source.compositor_pad.get_property('sizing-policy')
+        assert policy.value_nick == 'keep-aspect-ratio'
+
+    def test_a_hidden_source_keeps_its_pad(self, mixer):
+        """solo drops the others to alpha 0 rather than tearing them down, so
+        bringing one back is a property change and not a reconnect."""
+        kept = self._with_pad(mixer, 'a')
+        hidden = self._with_pad(mixer, 'b')
+        mixer.set_layout({'preset': 'solo', 'source': 'a'})
+        assert kept.compositor_pad.get_property('alpha') == 1.0
+        assert hidden.compositor_pad.get_property('alpha') == 0.0
+        assert hidden.compositor_pad is not None
+
+        mixer.set_layout({'preset': 'solo', 'source': 'b'})
+        assert hidden.compositor_pad.get_property('alpha') == 1.0
+
+    def test_moving_a_source_by_hand_takes_the_layout_out_of_force(self, mixer):
+        """Otherwise the move would last only until the next source joined."""
+        mixer.set_layout({'preset': 'grid'})
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        mixer.move_rtmp_source('a', 5, 6, 2)
+        assert mixer.layout is None
+        mixer.add_rtmp_source('b', DEAD_RTMP_URL)
+        assert (mixer.sources['a'].xpos, mixer.sources['a'].ypos) == (5, 6)
+
+    def test_resizing_a_source_by_hand_does_the_same(self, mixer):
+        mixer.set_layout({'preset': 'grid'})
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        mixer.resize_rtmp_source('a', 40, 30)
+        assert mixer.layout is None
+
+    def test_a_rejected_layout_changes_nothing(self, mixer):
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        mixer.set_layout({'preset': 'grid'})
+        before = mixer.sources['a'].width
+        with pytest.raises(videomixer.layout.LayoutError):
+            mixer.set_layout({'preset': 'mosaic'})
+        assert mixer.layout == {'preset': 'grid'}
+        assert mixer.sources['a'].width == before
+
+    def test_a_layout_that_stops_resolving_is_dropped_not_raised(self, mixer):
+        """Removing a solo's subject must not fail the removal.
+
+        The operator's request wins; the layout stops being tracked and the
+        remaining sources stay where they are.
+        """
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        mixer.add_rtmp_source('b', DEAD_RTMP_URL)
+        mixer.set_layout({'preset': 'solo', 'source': 'a'})
+        mixer.remove_rtmp_source('a')
+        assert mixer.layout is None
+        assert 'b' in mixer.sources
+
+    def test_clearing_a_layout_leaves_the_picture_alone(self, mixer):
+        mixer.set_layout({'preset': 'row'})
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        mixer.add_rtmp_source('b', DEAD_RTMP_URL)
+        placed = (mixer.sources['b'].xpos, mixer.sources['b'].width)
+        mixer.clear_layout()
+        assert mixer.layout is None
+        assert (mixer.sources['b'].xpos, mixer.sources['b'].width) == placed
+        # ... but a new source no longer reshapes anything.
+        mixer.add_rtmp_source('c', DEAD_RTMP_URL)
+        assert (mixer.sources['b'].xpos, mixer.sources['b'].width) == placed
+
+    def test_get_info_reports_the_layout(self, mixer):
+        assert mixer.get_info()['layout'] is None
+        mixer.set_layout({'preset': 'grid', 'gap': 4})
+        assert mixer.get_info()['layout'] == {'preset': 'grid', 'gap': 4}
+
+    def test_layout_uses_the_output_resolution_not_a_default(self, mixer):
+        """The fixture is 320x180; a full-canvas cell has to match that."""
+        mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+        cells = mixer.set_layout({'preset': 'solo'})
+        assert (cells['a'].width, cells['a'].height) == (320, 180)

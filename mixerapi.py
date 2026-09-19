@@ -10,6 +10,7 @@ import logging
 
 from aiohttp import web
 
+import layout
 import videomixer
 
 log = logging.getLogger(__name__)
@@ -18,6 +19,10 @@ log = logging.getLogger(__name__)
 def _error(message, status=400):
     return web.json_response({'status': 'FAIL', 'error': message},
                              status=status)
+
+
+def _cells(cells):
+    return {source_id: cell.as_dict() for source_id, cell in cells.items()}
 
 
 def _ok(**extra):
@@ -36,13 +41,25 @@ class MixerApi:
             web.get('/stream/{stream_id}', self.get_stream_handler),
             web.put('/stream/{stream_id}', self.create_handler),
             web.delete('/stream/{stream_id}', self.delete_handler),
-            web.put('/stream/{stream_id}/{pip_id}', self.add_stream_handler),
-            web.delete('/stream/{stream_id}/{pip_id}',
-                       self.remove_pip_handler),
-            web.post('/stream/{stream_id}/resize/{pip_id}',
-                     self.resize_handler),
-            web.post('/stream/{stream_id}/move/{pip_id}',
-                     self.move_pip_handler),
+            # The layout routes have to be registered before the
+            # {source_id} ones: aiohttp matches in registration order and
+            # /stream/x/layout fits both patterns, so the other way round a
+            # layout request would create a source called "layout".
+            web.get('/stream/{stream_id}/layout', self.get_layout_handler),
+            web.put('/stream/{stream_id}/layout', self.set_layout_handler),
+            web.delete('/stream/{stream_id}/layout',
+                       self.clear_layout_handler),
+            web.put('/stream/{stream_id}/{source_id}', self.add_source_handler),
+            web.delete('/stream/{stream_id}/{source_id}',
+                       self.remove_source_handler),
+            web.post('/stream/{stream_id}/resize/{source_id}',
+                     self.resize_source_handler),
+            web.post('/stream/{stream_id}/move/{source_id}',
+                     self.move_source_handler),
+            web.post('/stream/{stream_id}/fit/{source_id}',
+                     self.fit_handler),
+            web.post('/stream/{stream_id}/alpha/{source_id}',
+                     self.alpha_handler),
         ])
         self.app.on_shutdown.append(self._on_shutdown)
 
@@ -101,11 +118,18 @@ class MixerApi:
                 fps=int(body.get('fps', 30)),
                 video_bitrate=int(body.get('video_bitrate', 2500)),
                 audio_bitrate=int(body.get('audio_bitrate', 128)))
+            # Set before the background is added so the source lands in the
+            # layout rather than full-frame and then jumping.
+            if 'layout' in body:
+                mixer.set_layout(body['layout'])
             # bg_uri is optional now: the mixer has its own black/silent base
             # layer, so a stream can start empty and have sources added later.
             if bg_uri:
                 mixer.add_rtmp_source('bg', bg_uri, zorder=0)
             mixer.play()
+        except layout.LayoutError as exc:
+            mixer.shutdown()
+            return _error('invalid layout: {}'.format(exc))
         except Exception as exc:
             log.exception('Failed to create stream %s', stream_id)
             return _error('could not create stream: {}'.format(exc), 500)
@@ -120,77 +144,149 @@ class MixerApi:
         log.info('Deleted stream %s', stream_id)
         return _ok(stream_id=stream_id)
 
-    async def add_stream_handler(self, request):
+    async def add_source_handler(self, request):
         stream_id, mixer = self._mixer(request)
-        pip_id = request.match_info['pip_id']
+        source_id = request.match_info['source_id']
 
         body = await self._body(request)
         if 'stream_uri' not in body:
             return _error('stream_uri is required')
 
+        fit = body.get('fit', layout.CONTAIN)
+        if fit not in layout.FITS:
+            return _error('fit must be one of {}'.format(
+                ', '.join(layout.FITS)))
+        alpha = float(body.get('alpha', 1.0))
+        if not 0 <= alpha <= 1:
+            return _error('alpha must be between 0 and 1')
+
         try:
             mixer.add_rtmp_source(
-                pip_id,
+                source_id,
                 body['stream_uri'],
                 xpos=int(body.get('x', 0)),
                 ypos=int(body.get('y', 0)),
                 zorder=int(body.get('z', 1)),
                 width=int(body['width']) if body.get('width') else None,
-                height=int(body['height']) if body.get('height') else None)
+                height=int(body['height']) if body.get('height') else None,
+                fit=fit,
+                alpha=alpha)
         except ValueError as exc:
             return _error(str(exc), 409)
         except Exception as exc:
-            log.exception('Failed to add pip %s to %s', pip_id, stream_id)
+            log.exception('Failed to add source %s to %s', source_id, stream_id)
             return _error('could not add source: {}'.format(exc), 500)
 
         # New elements are synced to the running pipeline as they are added,
         # but re-asserting PLAYING is cheap and covers a paused mixer.
         mixer.play()
-        return _ok(stream_id=stream_id, pip_id=pip_id)
+        return _ok(stream_id=stream_id, source_id=source_id)
 
-    async def remove_pip_handler(self, request):
+    async def remove_source_handler(self, request):
         stream_id, mixer = self._mixer(request)
-        pip_id = request.match_info['pip_id']
+        source_id = request.match_info['source_id']
         try:
-            mixer.remove_rtmp_source(pip_id)
+            mixer.remove_rtmp_source(source_id)
         except KeyError as exc:
             return _error(str(exc), 404)
-        return _ok(stream_id=stream_id, pip_id=pip_id)
+        return _ok(stream_id=stream_id, source_id=source_id)
 
-    async def resize_handler(self, request):
+    async def resize_source_handler(self, request):
         stream_id, mixer = self._mixer(request)
-        pip_id = request.match_info['pip_id']
+        source_id = request.match_info['source_id']
 
         body = await self._body(request)
         if 'width' not in body or 'height' not in body:
             return _error('width and height are required')
 
         try:
-            mixer.resize_rtmp_source(pip_id, int(body['width']),
+            mixer.resize_rtmp_source(source_id, int(body['width']),
                                      int(body['height']))
         except KeyError as exc:
             return _error(str(exc), 404)
-        return _ok(stream_id=stream_id, pip_id=pip_id)
+        return _ok(stream_id=stream_id, source_id=source_id)
 
-    async def move_pip_handler(self, request):
+    async def move_source_handler(self, request):
         stream_id, mixer = self._mixer(request)
-        pip_id = request.match_info['pip_id']
+        source_id = request.match_info['source_id']
 
         body = await self._body(request)
         try:
-            source = mixer.sources[pip_id]
+            source = mixer.sources[source_id]
         except KeyError:
-            return _error('pip_id={} does not exist'.format(pip_id), 404)
+            return _error('source_id={} does not exist'.format(source_id), 404)
 
         try:
             mixer.move_rtmp_source(
-                pip_id,
+                source_id,
                 int(body.get('x', source.xpos)),
                 int(body.get('y', source.ypos)),
                 int(body.get('z', source.zorder)))
         except KeyError as exc:
             return _error(str(exc), 404)
-        return _ok(stream_id=stream_id, pip_id=pip_id)
+        return _ok(stream_id=stream_id, source_id=source_id)
+
+    async def fit_handler(self, request):
+        stream_id, mixer = self._mixer(request)
+        source_id = request.match_info['source_id']
+
+        body = await self._body(request)
+        if 'fit' not in body:
+            return _error('fit is required')
+        if body['fit'] not in layout.FITS:
+            return _error('fit must be one of {}'.format(
+                ', '.join(layout.FITS)))
+
+        try:
+            mixer.set_source_fit(source_id, body['fit'])
+        except KeyError as exc:
+            return _error(str(exc), 404)
+        return _ok(stream_id=stream_id, source_id=source_id)
+
+    async def alpha_handler(self, request):
+        stream_id, mixer = self._mixer(request)
+        source_id = request.match_info['source_id']
+
+        body = await self._body(request)
+        if 'alpha' not in body:
+            return _error('alpha is required')
+
+        try:
+            mixer.set_source_alpha(source_id, float(body['alpha']))
+        except KeyError as exc:
+            return _error(str(exc), 404)
+        except ValueError as exc:
+            return _error(str(exc))
+        return _ok(stream_id=stream_id, source_id=source_id)
+
+    # -- layout ------------------------------------------------------------
+
+    async def get_layout_handler(self, request):
+        stream_id, mixer = self._mixer(request)
+        return web.json_response({
+            'stream_id': stream_id,
+            'layout': mixer.layout,
+            'cells': _cells(mixer.resolved_layout()),
+        })
+
+    async def set_layout_handler(self, request):
+        stream_id, mixer = self._mixer(request)
+        body = await self._body(request)
+        try:
+            cells = mixer.set_layout(body)
+        except layout.LayoutError as exc:
+            return _error(str(exc))
+        return _ok(stream_id=stream_id, layout=body, cells=_cells(cells))
+
+    async def clear_layout_handler(self, request):
+        """Stop tracking a layout without moving anything.
+
+        The picture does not change; what changes is that the next source to
+        join or drop no longer reshapes it.
+        """
+        stream_id, mixer = self._mixer(request)
+        mixer.clear_layout()
+        return _ok(stream_id=stream_id)
 
     # -- lifecycle ---------------------------------------------------------
 

@@ -34,6 +34,7 @@ this project had before.
 import logging
 import os
 
+import layout
 import rtmpsource
 
 import gi
@@ -63,6 +64,12 @@ class VideoMixer:
     def __init__(self, output_url, width=1280, height=720, fps=30,
                  video_bitrate=2500, audio_bitrate=128):
         self.sources = {}
+        # The layout spec currently in force, or None while geometry is being
+        # driven one source at a time through move/resize. It is kept as the
+        # spec rather than as resolved rectangles because it has to be
+        # re-resolved every time the set of connected sources changes -- that
+        # is what makes a grid reshape itself when a publisher joins or drops.
+        self.layout = None
         self.output_url = output_url
         self.width = width
         self.height = height
@@ -103,11 +110,11 @@ class VideoMixer:
     def shutdown(self):
         """Tear the pipeline down and release every source."""
         log.info('Shutting down pipeline -> %s', self.output_url)
-        for pip_id in list(self.sources):
+        for source_id in list(self.sources):
             try:
-                self.sources[pip_id].remove()
+                self.sources[source_id].remove()
             except Exception:
-                log.exception('Error removing source %s', pip_id)
+                log.exception('Error removing source %s', source_id)
         self.sources.clear()
         if self.bus_watch_id is not None:
             GLib.source_remove(self.bus_watch_id)
@@ -116,31 +123,122 @@ class VideoMixer:
 
     # -- sources -----------------------------------------------------------
 
-    def add_rtmp_source(self, pip_id, location, xpos=0, ypos=0, zorder=1,
-                        width=None, height=None):
-        if pip_id in self.sources:
-            raise ValueError('pip_id={} already exists'.format(pip_id))
+    def add_rtmp_source(self, source_id, location, xpos=0, ypos=0, zorder=1,
+                        width=None, height=None, fit=layout.CONTAIN,
+                        alpha=1.0):
+        if source_id in self.sources:
+            raise ValueError('source_id={} already exists'.format(source_id))
         source = rtmpsource.RtmpSource(location, self.pipeline,
                                        self.compositor, self.audiomixer,
-                                       xpos, ypos, zorder, width, height)
-        self.sources[pip_id] = source
-        self.dump_dot('source-{}'.format(pip_id))
+                                       xpos, ypos, zorder, width, height,
+                                       fit, alpha)
+        self.sources[source_id] = source
+        # Under a layout the geometry passed in is only a starting point: the
+        # layout is re-resolved with the new source included and overwrites it.
+        self.apply_layout()
+        self.dump_dot('source-{}'.format(source_id))
         return source
 
-    def remove_rtmp_source(self, pip_id):
-        self._get(pip_id).remove()
-        del self.sources[pip_id]
+    def remove_rtmp_source(self, source_id):
+        self._get(source_id).remove()
+        del self.sources[source_id]
+        # The remaining sources close the gap: a 4-up becomes a 3-up.
+        self.apply_layout()
 
-    def resize_rtmp_source(self, pip_id, width, height):
-        self._get(pip_id).resize(width, height)
+    def resize_rtmp_source(self, source_id, width, height):
+        self._get(source_id).resize(width, height)
+        self._layout_overridden('resize', source_id)
 
-    def move_rtmp_source(self, pip_id, xpos, ypos, zorder):
-        self._get(pip_id).move(xpos, ypos, zorder)
+    def move_rtmp_source(self, source_id, xpos, ypos, zorder):
+        self._get(source_id).move(xpos, ypos, zorder)
+        self._layout_overridden('move', source_id)
 
-    def _get(self, pip_id):
-        if pip_id not in self.sources:
-            raise KeyError('pip_id={} does not exist'.format(pip_id))
-        return self.sources[pip_id]
+    def set_source_fit(self, source_id, fit):
+        self._get(source_id).set_fit(fit)
+        self._layout_overridden('fit', source_id)
+
+    def set_source_alpha(self, source_id, alpha):
+        self._get(source_id).set_alpha(alpha)
+        self._layout_overridden('alpha', source_id)
+
+    def _get(self, source_id):
+        if source_id not in self.sources:
+            raise KeyError('source_id={} does not exist'.format(source_id))
+        return self.sources[source_id]
+
+    # -- layout ------------------------------------------------------------
+
+    def set_layout(self, spec):
+        """Adopt a layout spec and place every source it covers.
+
+        Resolution happens before anything is stored, so a spec that does not
+        make sense leaves the stream exactly as it was rather than half moved.
+        """
+        cells = self._resolve(spec)
+        self.layout = spec
+        self._place(cells)
+        log.info('[%s] layout: %s', self.output_url, spec)
+        self.dump_dot('layout')
+        return cells
+
+    def apply_layout(self):
+        """Re-resolve the current layout against the sources connected now.
+
+        Called on every membership change. A layout that has stopped resolving
+        -- a solo whose subject was just removed, say -- is dropped rather than
+        allowed to fail the add or remove that triggered it: the operator's
+        request succeeds, the sources keep their geometry, and the log says
+        why the layout is no longer in force.
+        """
+        if self.layout is None:
+            return {}
+        try:
+            cells = self._resolve(self.layout)
+        except layout.LayoutError as exc:
+            log.warning('[%s] layout %s no longer resolves (%s); leaving '
+                        'sources where they are', self.output_url,
+                        self.layout, exc)
+            self.layout = None
+            return {}
+        self._place(cells)
+        return cells
+
+    def clear_layout(self):
+        """Stop tracking a layout. Sources stay exactly where they are."""
+        self.layout = None
+
+    def resolved_layout(self):
+        """The current layout as rectangles, for reporting."""
+        if self.layout is None:
+            return {}
+        try:
+            return self._resolve(self.layout)
+        except layout.LayoutError:
+            return {}
+
+    def _resolve(self, spec):
+        return layout.resolve(spec, self.width, self.height,
+                              list(self.sources))
+
+    def _place(self, cells):
+        for source_id, cell in cells.items():
+            self.sources[source_id].set_cell(cell)
+
+    def _layout_overridden(self, what, source_id):
+        """Drop the layout after a source is placed by hand.
+
+        Cells carry fit and alpha as well as a rectangle, so every one of these
+        calls is something the layout would set again on its next resolve --
+        placing a source by hand under a live layout would otherwise last only
+        until the next publisher joined. Rather than silently undo the
+        operator, or refuse the request, the manual placement wins and the
+        layout stops being tracked.
+        """
+        if self.layout is None:
+            return
+        log.info('[%s] %s of %s overrides layout %s; layout cleared',
+                 self.output_url, what, source_id, self.layout)
+        self.layout = None
 
     def get_info(self):
         return {
@@ -149,8 +247,9 @@ class VideoMixer:
             'height': self.height,
             'fps': self.fps,
             'state': self.pipeline.get_state(0)[1].value_nick,
-            'pip_streams': {pid: s.get_info()
-                            for pid, s in self.sources.items()},
+            'layout': self.layout,
+            'sources': {source_id: source.get_info()
+                        for source_id, source in self.sources.items()},
         }
 
     # -- construction ------------------------------------------------------
@@ -179,7 +278,7 @@ class VideoMixer:
         # that has stopped delivering (a dropped RTMP publisher) from stalling
         # the mix, and min_upstream_latency reserves headroom for sources that
         # get plugged in after playback has started, which is the normal case
-        # here -- every PiP arrives late.
+        # here -- every source arrives late.
         self.compositor = self._make('compositor', 'compositor',
                                      background='black',
                                      latency=AGGREGATOR_LATENCY,

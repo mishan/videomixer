@@ -16,7 +16,7 @@ Two rules matter and both were violated by the original implementation:
 2. Elements added to an already-PLAYING pipeline start life in NULL state and
    will never produce data until told otherwise. Every element added here is
    followed by sync_state_with_parent(), which is what makes it possible to
-   add a PiP to a running stream.
+   add a source to a running stream.
 
 Sources also reconnect on their own. A publisher going away is invisible at the
 pipeline level -- rtmp2src emits EOS on its src pad, but the mixer's base layers
@@ -29,6 +29,8 @@ import logging
 import random
 import threading
 
+import layout
+
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst, GLib  # noqa: E402
@@ -36,6 +38,14 @@ from gi.repository import Gst, GLib  # noqa: E402
 log = logging.getLogger(__name__)
 
 AUDIO_CAPS = 'audio/x-raw,rate=44100,channels=2,format=S16LE,layout=interleaved'
+
+# layout fit -> the compositor pad property that implements it. `contain`
+# scales the source to fit its cell and leaves the rest of the cell alone, so
+# whatever is below shows through instead of being letterboxed in black.
+SIZING_POLICY = {
+    layout.CONTAIN: 'keep-aspect-ratio',
+    layout.FILL: 'none',
+}
 
 # Connection states reported through the API.
 CONNECTING = 'connecting'
@@ -46,8 +56,8 @@ RECONNECTING = 'reconnecting'
 class RtmpSource:
     # compositor zorder 0 is reserved for the mixer's always-black base layer,
     # so every real source is shifted one step up. Callers keep using the
-    # documented scheme (background z=0, PiPs z>=1) and self.zorder always
-    # holds that caller-facing value.
+    # documented scheme (background z=0, everything above it z>=1) and
+    # self.zorder always holds that caller-facing value.
     ZORDER_OFFSET = 1
 
     # Reconnect backoff: 1, 2, 4, 8, then 10s forever, never giving up. The cap
@@ -71,7 +81,8 @@ class RtmpSource:
     IDLE_TIMEOUT = 15
 
     def __init__(self, location, pipeline, compositor, audiomixer,
-                 xpos=0, ypos=0, zorder=1, width=None, height=None):
+                 xpos=0, ypos=0, zorder=1, width=None, height=None,
+                 fit=layout.CONTAIN, alpha=1.0):
         self.location = location
         self.pipeline = pipeline
         self.compositor = compositor
@@ -82,6 +93,8 @@ class RtmpSource:
         self.zorder = zorder
         self.width = width
         self.height = height
+        self.fit = fit
+        self.alpha = alpha
 
         # Native dimensions, discovered from the decoded caps.
         self.video_width = None
@@ -234,13 +247,9 @@ class RtmpSource:
             return
 
         self._align_to_running_time(self.compositor_pad)
-        self.compositor_pad.set_property('xpos', self.xpos)
-        self.compositor_pad.set_property('ypos', self.ypos)
-        self.compositor_pad.set_property('zorder',
-                                         self.zorder + self.ZORDER_OFFSET)
-        # compositor scales on the pad itself; 0 means "use the native size".
-        self.compositor_pad.set_property('width', self.width or 0)
-        self.compositor_pad.set_property('height', self.height or 0)
+        # Geometry lives on the source, not on the pad, so a pad obtained after
+        # a reconnect gets the layout the source had before it dropped.
+        self._apply_geometry()
 
         if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
             log.error('[%s] could not link decoded video pad', self.location)
@@ -447,13 +456,57 @@ class RtmpSource:
 
     # -- control -----------------------------------------------------------
 
+    def _apply_geometry(self):
+        """Push the source's geometry onto its compositor pad.
+
+        Every setter writes to the source and then calls this, rather than
+        writing to the pad directly, because the pad is not permanent: it is
+        released when a publisher drops and requested again on reconnect. State
+        that lived only on the pad would be lost with it, and the layer would
+        come back full-frame in the top-left corner instead of where the layout
+        put it.
+
+        A no-op before the source has decoded anything -- there is no pad until
+        then, and the geometry is applied to the new one in _on_video_decoded.
+        """
+        pad = self.compositor_pad
+        if pad is None:
+            return
+        pad.set_property('xpos', self.xpos)
+        pad.set_property('ypos', self.ypos)
+        pad.set_property('zorder', self.zorder + self.ZORDER_OFFSET)
+        # compositor scales on the pad itself; 0 means "use the native size".
+        pad.set_property('width', self.width or 0)
+        pad.set_property('height', self.height or 0)
+        pad.set_property('alpha', self.alpha)
+        self._apply_fit(pad)
+
+    def _apply_fit(self, pad):
+        """Set how the source is fitted to a cell it does not match.
+
+        sizing-policy arrived in GStreamer 1.20. Older compositors stretch and
+        have no way not to, so this degrades to that rather than refusing to
+        run -- a warning names the reason the picture looks wrong.
+        """
+        if pad.find_property('sizing-policy') is None:
+            if self.fit != layout.FILL:
+                log.warning('[%s] this compositor has no sizing-policy, so '
+                            '"%s" is not available -- sources are stretched to '
+                            'their cell (GStreamer 1.20+ has it)',
+                            self.location, self.fit)
+            return
+        pad.set_property('sizing-policy', SIZING_POLICY[self.fit])
+
+    def set_cell(self, cell):
+        """Place this source according to a resolved layout cell."""
+        self.xpos, self.ypos = cell.x, cell.y
+        self.width, self.height = cell.width, cell.height
+        self.zorder, self.fit, self.alpha = cell.zorder, cell.fit, cell.alpha
+        self._apply_geometry()
+
     def move(self, xpos, ypos, zorder):
         self.xpos, self.ypos, self.zorder = xpos, ypos, zorder
-        if self.compositor_pad is None:
-            return
-        self.compositor_pad.set_property('xpos', xpos)
-        self.compositor_pad.set_property('ypos', ypos)
-        self.compositor_pad.set_property('zorder', zorder + self.ZORDER_OFFSET)
+        self._apply_geometry()
 
     def shift(self, xdiff, ydiff, zdiff=0):
         width = self.video_width or 1
@@ -464,10 +517,20 @@ class RtmpSource:
 
     def resize(self, width, height):
         self.width, self.height = width, height
-        if self.compositor_pad is None:
-            return
-        self.compositor_pad.set_property('width', width or 0)
-        self.compositor_pad.set_property('height', height or 0)
+        self._apply_geometry()
+
+    def set_fit(self, fit):
+        if fit not in SIZING_POLICY:
+            raise ValueError('fit must be one of {}'.format(
+                ', '.join(sorted(SIZING_POLICY))))
+        self.fit = fit
+        self._apply_geometry()
+
+    def set_alpha(self, alpha):
+        if not 0 <= alpha <= 1:
+            raise ValueError('alpha must be between 0 and 1')
+        self.alpha = float(alpha)
+        self._apply_geometry()
 
     def remove(self):
         """Detach this source for good and free everything it owns."""
@@ -497,6 +560,8 @@ class RtmpSource:
                 'xpos': self.xpos,
                 'ypos': self.ypos,
                 'zorder': self.zorder,
+                'fit': self.fit,
+                'alpha': self.alpha,
             },
             'has_audio': self.audiomixer_pad is not None,
         }
