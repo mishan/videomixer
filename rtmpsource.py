@@ -30,10 +30,12 @@ import random
 import threading
 
 import layout
+import transition
 
 import gi
 gi.require_version('Gst', '1.0')
-from gi.repository import Gst, GLib  # noqa: E402
+gi.require_version('GstController', '1.0')
+from gi.repository import Gst, GstController, GLib  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +84,7 @@ class RtmpSource:
 
     def __init__(self, location, pipeline, compositor, audiomixer,
                  xpos=0, ypos=0, zorder=1, width=None, height=None,
-                 fit=layout.CONTAIN, alpha=1.0):
+                 fit=layout.CONTAIN, alpha=1.0, fps=30):
         self.location = location
         self.pipeline = pipeline
         self.compositor = compositor
@@ -95,6 +97,7 @@ class RtmpSource:
         self.height = height
         self.fit = fit
         self.alpha = alpha
+        self.fps = fps
 
         # Native dimensions, discovered from the decoded caps.
         self.video_width = None
@@ -110,6 +113,10 @@ class RtmpSource:
         self._closed = False
         self._rebuilding = False
         self._reconnect_timer = None
+        self._transition_bindings = []
+        self._transition_timer = None
+        self._transition_generation = 0
+        self._pending_transition = None
         self.state = CONNECTING
         self.reconnect_attempts = 0
         self.last_error = None
@@ -249,7 +256,11 @@ class RtmpSource:
         self._align_to_running_time(self.compositor_pad)
         # Geometry lives on the source, not on the pad, so a pad obtained after
         # a reconnect gets the layout the source had before it dropped.
+        pending = self._pending_transition
         self._apply_geometry()
+        if pending is not None:
+            frames, cell, duration = pending
+            self.start_transition(frames, cell, duration)
 
         if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
             log.error('[%s] could not link decoded video pad', self.location)
@@ -438,6 +449,7 @@ class RtmpSource:
         the old one down -- cannot both release the same pad or remove the same
         element from the pipeline. Whoever loses gets an empty list.
         """
+        self._drop_transition()
         with self._lock:
             elements = self.elements
             self.elements = []
@@ -456,6 +468,88 @@ class RtmpSource:
 
     # -- control -----------------------------------------------------------
 
+    def _drop_transition(self):
+        """Cancel a transition before a manual write or pad teardown."""
+        with self._lock:
+            self._transition_generation += 1
+            if self._transition_timer is not None:
+                GLib.source_remove(self._transition_timer)
+                self._transition_timer = None
+            pad = self.compositor_pad
+            for binding in self._transition_bindings:
+                if pad is not None:
+                    pad.remove_control_binding(binding)
+            self._transition_bindings = []
+            self._pending_transition = None
+
+    def current_transition_cell(self, canvas_width, canvas_height):
+        """Read the live pad position, including an in-flight interpolation."""
+        with self._lock:
+            pad = self.compositor_pad
+            if pad is None:
+                return None
+            values = {prop: float(pad.get_property(prop))
+                      for prop in transition.PROPERTIES}
+            if not values['width']:
+                values['width'] = float(self.video_width or canvas_width)
+            if not values['height']:
+                values['height'] = float(self.video_height or canvas_height)
+            return values
+
+    def start_transition(self, frames, cell, duration, joining=False):
+        """Install compositor control bindings for one planned cell change."""
+        awaiting_first_frame = self._pending_transition is not None
+        self._drop_transition()
+        self._store_cell(cell)
+        pad = self.compositor_pad
+        if pad is None:
+            if joining or awaiting_first_frame:
+                # A new publisher has no pad until its first decoded frame.
+                self._pending_transition = (frames, cell, duration)
+            return
+
+        self._apply_fit(pad)
+        if cell.zorder >= pad.get_property('zorder') - self.ZORDER_OFFSET:
+            pad.set_property('zorder', cell.zorder + self.ZORDER_OFFSET)
+        clock = self.pipeline.get_clock()
+        now = max(0, clock.get_time() - self.pipeline.get_base_time()) if clock else 0
+        for prop in transition.PROPERTIES:
+            points = frames.get(prop)
+            if not points:
+                pad.set_property(prop, getattr(self, prop))
+                continue
+            pad.set_property(prop, points[0][1])
+            control = GstController.InterpolationControlSource()
+            control.set_property('mode', GstController.InterpolationMode.LINEAR)
+            binding = GstController.DirectControlBinding.new_absolute(
+                pad, prop, control)
+            pad.add_control_binding(binding)
+            for offset, value in points:
+                control.set(now + int(offset * Gst.SECOND), value)
+            self._transition_bindings.append(binding)
+
+        if not self._transition_bindings:
+            self._apply_geometry()
+            return
+        generation = self._transition_generation
+        frame_ms = int(1000 / self.fps) + 1
+        self._transition_timer = GLib.timeout_add(
+            int(duration * 1000) + frame_ms, self._settle_transition,
+            generation, pad, cell)
+
+    def _settle_transition(self, generation, pad, cell):
+        with self._lock:
+            if generation != self._transition_generation or pad is not self.compositor_pad:
+                return GLib.SOURCE_REMOVE
+            self._transition_timer = None
+            self.set_cell(cell)
+        return GLib.SOURCE_REMOVE
+
+    def _store_cell(self, cell):
+        self.xpos, self.ypos = cell.x, cell.y
+        self.width, self.height = cell.width, cell.height
+        self.zorder, self.fit, self.alpha = cell.zorder, cell.fit, cell.alpha
+
     def _apply_geometry(self):
         """Push the source's geometry onto its compositor pad.
 
@@ -470,6 +564,7 @@ class RtmpSource:
         then, and the geometry is applied to the new one in _on_video_decoded.
         """
         pad = self.compositor_pad
+        self._drop_transition()
         if pad is None:
             return
         pad.set_property('xpos', self.xpos)
@@ -499,9 +594,7 @@ class RtmpSource:
 
     def set_cell(self, cell):
         """Place this source according to a resolved layout cell."""
-        self.xpos, self.ypos = cell.x, cell.y
-        self.width, self.height = cell.width, cell.height
-        self.zorder, self.fit, self.alpha = cell.zorder, cell.fit, cell.alpha
+        self._store_cell(cell)
         self._apply_geometry()
 
     def move(self, xpos, ypos, zorder):

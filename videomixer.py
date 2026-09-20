@@ -36,6 +36,7 @@ import os
 
 import layout
 import rtmpsource
+import transition
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -131,11 +132,11 @@ class VideoMixer:
         source = rtmpsource.RtmpSource(location, self.pipeline,
                                        self.compositor, self.audiomixer,
                                        xpos, ypos, zorder, width, height,
-                                       fit, alpha)
+                                       fit, alpha, fps=self.fps)
         self.sources[source_id] = source
         # Under a layout the geometry passed in is only a starting point: the
         # layout is re-resolved with the new source included and overwrites it.
-        self.apply_layout()
+        self.apply_layout(joining=source_id)
         self.dump_dot('source-{}'.format(source_id))
         return source
 
@@ -176,12 +177,12 @@ class VideoMixer:
         """
         cells = self._resolve(spec)
         self.layout = spec
-        self._place(cells)
+        self._place(cells, spec)
         log.info('[%s] layout: %s', self.output_url, spec)
         self.dump_dot('layout')
         return cells
 
-    def apply_layout(self):
+    def apply_layout(self, joining=None):
         """Re-resolve the current layout against the sources connected now.
 
         Called on every membership change. A layout that has stopped resolving
@@ -200,7 +201,7 @@ class VideoMixer:
                         self.layout, exc)
             self.layout = None
             return {}
-        self._place(cells)
+        self._place(cells, self.layout, joining)
         return cells
 
     def clear_layout(self):
@@ -220,9 +221,21 @@ class VideoMixer:
         return layout.resolve(spec, self.width, self.height,
                               list(self.sources))
 
-    def _place(self, cells):
+    def _place(self, cells, spec, joining=None):
+        settings = transition.settings(spec)
+        if settings is None:
+            for source_id, cell in cells.items():
+                self.sources[source_id].set_cell(cell)
+            return
+        duration, easing = settings
+        starts = {source_id: (None if source_id == joining else
+                              self.sources[source_id].current_transition_cell(
+                                  self.width, self.height))
+                  for source_id in cells}
+        frames = transition.plan(starts, cells, duration, easing)
         for source_id, cell in cells.items():
-            self.sources[source_id].set_cell(cell)
+            self.sources[source_id].start_transition(
+                frames[source_id], cell, duration, joining=source_id == joining)
 
     def _layout_overridden(self, what, source_id):
         """Drop the layout after a source is placed by hand.

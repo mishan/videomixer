@@ -39,6 +39,7 @@ one.
 
 import collections
 import math
+import transition
 
 # How a source that does not match the aspect ratio of its cell is fitted.
 # `contain` scales it to fit and leaves the remainder of the cell untouched,
@@ -64,7 +65,7 @@ CORNERS = ('top-left', 'top-right', 'bottom-left', 'bottom-right')
 POSITIONS = ('top', 'bottom', 'left', 'right')
 
 # Keys every spec accepts, whichever shape it takes.
-COMMON_KEYS = frozenset(['units', 'gap', 'margin', 'fit'])
+COMMON_KEYS = frozenset(['units', 'gap', 'margin', 'fit', 'transition'])
 # ... plus these, which only mean anything to a preset.
 PRESET_COMMON_KEYS = frozenset(['preset', 'order', 'exclude'])
 
@@ -136,6 +137,11 @@ def resolve(spec, canvas_width, canvas_height, source_ids):
         raise LayoutError('layout must be a JSON object')
     if 'preset' in spec and 'cells' in spec:
         raise LayoutError('layout takes either "preset" or "cells", not both')
+
+    try:
+        transition.settings(spec)
+    except ValueError as exc:
+        raise LayoutError(str(exc)) from exc
 
     units = _one_of(spec, 'units', UNITS, PIXELS)
     fit = _one_of(spec, 'fit', FITS, CONTAIN)
