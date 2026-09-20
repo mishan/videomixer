@@ -91,6 +91,10 @@ restart.
 Under a layout the geometry here is only a starting point: the layout is
 re-resolved with the new source included and overwrites it.
 
+`layout` is a reserved source id: `/stream/{id}/layout` is the layout
+endpoint, so it cannot also name a source. Trying to add one comes back as a
+409 saying so.
+
 ### The rest
 
 | method   | path                                   | does                              |
@@ -178,6 +182,11 @@ share) and `position` (`bottom`, `top`, `left` or `right`).
 
     {"preset": "pip", "source": "host", "size": 0.3, "corner": "top-right"}
     {"preset": "spotlight", "source": "speaker", "position": "left"}
+
+`pip` insets march inward from the chosen corner, and shrink below `size` once
+there are more of them than fit along that edge — for the same reason a grid
+grows a row rather than truncating. Nothing an operator does to the layout
+should push a live publisher off the canvas.
 
 A source `solo` has no room for is dropped to `alpha` 0 rather than torn down.
 It keeps its branch and its mixer pad, so bringing it back is a property change

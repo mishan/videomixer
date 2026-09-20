@@ -230,6 +230,22 @@ def _pip(ids, subject, canvas, fit, gap, size, corner):
     # the canvas, which is what a PiP is expected to look like.
     width = max(1, int(round(canvas.width * size)))
     height = max(1, int(round(canvas.height * size)))
+
+    # Enough insets at the requested size would march straight off the edge --
+    # the fifth inset of a default-sized PiP on a 1280px canvas starts at a
+    # negative x and is simply not on screen. Shrink them to fit instead, for
+    # the same reason a grid grows a row rather than truncating: no layout may
+    # make a connected publisher vanish.
+    room = canvas.width - gap * (len(insets) + 1)
+    if room < len(insets):
+        raise LayoutError(
+            'cannot fit {} inset(s) with a {}px gap into a {}px canvas'.format(
+                len(insets), gap, canvas.width))
+    if width * len(insets) > room:
+        shrink = room / (width * len(insets))
+        width = max(1, int(width * shrink))
+        height = max(1, int(height * shrink))
+
     top = corner.startswith('top')
     left = corner.endswith('left')
 

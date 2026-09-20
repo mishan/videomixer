@@ -483,3 +483,85 @@ async def test_fit_and_alpha_take_the_layout_out_of_force(client):
     await client.put('/stream/s1/cam', json={'stream_uri': 'rtmp://in/live/c'})
     await client.post('/stream/s1/fit/cam', json={'fit': 'fill'})
     assert FakeMixer.instances[-1].layout is None
+
+
+# --- malformed numbers are the client's mistake, not a 500 ----------------
+
+@pytest.mark.parametrize('label,method,path,body,field', [
+    ('create width', 'put', '/stream/new',
+     {'output_uri': 'rtmp://o/x', 'width': 'wide'}, 'width'),
+    ('create fps null', 'put', '/stream/new',
+     {'output_uri': 'rtmp://o/x', 'fps': None}, 'fps'),
+    ('create bitrate', 'put', '/stream/new',
+     {'output_uri': 'rtmp://o/x', 'video_bitrate': 'lots'}, 'video_bitrate'),
+    ('add x', 'put', '/stream/s1/new',
+     {'stream_uri': 'rtmp://i/c', 'x': 'left'}, 'x'),
+    ('add z list', 'put', '/stream/s1/new',
+     {'stream_uri': 'rtmp://i/c', 'z': [1]}, 'z'),
+    ('add width', 'put', '/stream/s1/new',
+     {'stream_uri': 'rtmp://i/c', 'width': 'big'}, 'width'),
+    ('add alpha text', 'put', '/stream/s1/new',
+     {'stream_uri': 'rtmp://i/c', 'alpha': 'half'}, 'alpha'),
+    ('add alpha null', 'put', '/stream/s1/new',
+     {'stream_uri': 'rtmp://i/c', 'alpha': None}, 'alpha'),
+    ('resize width', 'post', '/stream/s1/resize/cam',
+     {'width': 'big', 'height': 10}, 'width'),
+    ('resize height', 'post', '/stream/s1/resize/cam',
+     {'width': 10, 'height': None}, 'height'),
+    ('move x', 'post', '/stream/s1/move/cam', {'x': 'left'}, 'x'),
+    ('alpha text', 'post', '/stream/s1/alpha/cam', {'alpha': 'half'}, 'alpha'),
+    ('alpha null', 'post', '/stream/s1/alpha/cam', {'alpha': None}, 'alpha'),
+])
+async def test_malformed_numbers_are_400_not_500(client, label, method, path,
+                                                 body, field):
+    """A typo in a request field used to raise out of the handler.
+
+    int('wide') raises ValueError and a JSON null raises TypeError; neither
+    was caught, so every one of these came back as an aiohttp 500 with a
+    stack trace in the log.
+    """
+    await create_stream(client, 's1')
+    await client.put('/stream/s1/cam', json={'stream_uri': 'rtmp://i/c'})
+    resp = await getattr(client, method)(path, json=body)
+    assert resp.status == 400, '{} gave {}'.format(label, resp.status)
+    assert field in (await resp.json())['error']
+
+
+async def test_a_bad_coordinate_is_not_reported_as_a_conflict(client):
+    """It used to land in the duplicate-source-id branch and return 409."""
+    await create_stream(client, 's1')
+    resp = await client.put('/stream/s1/cam',
+                            json={'stream_uri': 'rtmp://i/c', 'x': 'left'})
+    assert resp.status == 400
+
+
+async def test_absent_numbers_still_fall_back_to_defaults(client):
+    """Only a field that is present-but-null is an error."""
+    await create_stream(client, 's1')
+    resp = await client.put('/stream/s1/cam',
+                            json={'stream_uri': 'rtmp://in/live/cam'})
+    assert resp.status == 200
+    assert FakeMixer.instances[-1].calls[-1] == (
+        'add', 'cam', 'rtmp://in/live/cam', 0, 0, 1, None, None,
+        'contain', 1.0)
+
+
+async def test_a_quote_in_a_stream_id_still_yields_valid_json(client):
+    """The not-found body was built with format(), so a quote broke it."""
+    resp = await client.get('/stream/no"such')
+    assert resp.status == 404
+    assert (await resp.json())['status'] == 'FAIL'
+
+
+async def test_layout_is_a_reserved_source_id(client):
+    """PUT /stream/{id}/layout shadows the add-source route.
+
+    Without this the request is handled as a layout spec and fails with a
+    confusing "layout needs either preset or cells".
+    """
+    await create_stream(client, 's1')
+    resp = await client.put('/stream/s1/layout',
+                            json={'stream_uri': 'rtmp://in/live/cam'})
+    assert resp.status == 409
+    assert 'reserved' in (await resp.json())['error']
+    assert 'layout' not in FakeMixer.instances[-1].sources

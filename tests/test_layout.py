@@ -345,3 +345,70 @@ def test_spotlight_that_leaves_no_room_for_the_subject_is_rejected():
         layout.resolve({'preset': 'spotlight', 'source': 's0', 'size': 1.0},
                        1280, 720, ids(2))
     assert 'no room' in str(excinfo.value)
+
+
+# -- nothing may be laid out off the canvas --------------------------------
+
+@pytest.mark.parametrize('count', [1, 2, 3, 4, 5, 6, 9, 16])
+def test_pip_insets_never_leave_the_canvas(count):
+    """Insets shrink to fit rather than marching off the edge.
+
+    At the requested size the fifth inset of a default PiP on a 1280px canvas
+    started at a negative x, so a connected publisher was simply not on
+    screen. A preset may reshape whatever it likes; it may not make a source
+    disappear.
+    """
+    ids = ['big'] + ['s{}'.format(i) for i in range(count)]
+    cells = layout.resolve({'preset': 'pip', 'source': 'big', 'gap': 8},
+                           1280, 720, ids)
+    assert len(cells) == count + 1
+    for source_id, cell in cells.items():
+        assert cell.x >= 0, '{} starts off the left edge'.format(source_id)
+        assert cell.y >= 0, '{} starts above the top edge'.format(source_id)
+        assert cell.x + cell.width <= 1280, \
+            '{} runs off the right edge'.format(source_id)
+        assert cell.y + cell.height <= 720, \
+            '{} runs off the bottom edge'.format(source_id)
+
+
+@pytest.mark.parametrize('corner', layout.CORNERS)
+def test_pip_insets_stay_on_canvas_from_every_corner(corner):
+    ids = ['big'] + ['s{}'.format(i) for i in range(6)]
+    cells = layout.resolve(
+        {'preset': 'pip', 'source': 'big', 'corner': corner, 'gap': 10},
+        1280, 720, ids)
+    for cell in cells.values():
+        assert 0 <= cell.x and cell.x + cell.width <= 1280
+        assert 0 <= cell.y and cell.y + cell.height <= 720
+
+
+def test_pip_keeps_the_requested_size_when_it_fits():
+    """Shrinking is a fallback, not the normal case."""
+    cells = layout.resolve({'preset': 'pip', 'source': 'big', 'size': 0.25},
+                           1280, 720, ['big', 'a', 'b'])
+    assert (cells['a'].width, cells['a'].height) == (320, 180)
+
+
+def test_pip_insets_keep_the_canvas_aspect_ratio_when_shrunk():
+    cells = layout.resolve({'preset': 'pip', 'source': 'big'},
+                           1280, 720, ['big'] + list('abcdef'))
+    inset = cells['a']
+    assert abs(inset.width / inset.height - 1280 / 720) < 0.05
+
+
+def test_pip_with_no_room_for_insets_is_rejected():
+    with pytest.raises(layout.LayoutError) as excinfo:
+        layout.resolve({'preset': 'pip', 'source': 'big', 'gap': 40},
+                       320, 180, ['big'] + list('abcdefgh'))
+    assert 'cannot fit' in str(excinfo.value)
+
+
+@pytest.mark.parametrize('preset', ['grid', 'row', 'column', 'spotlight'])
+def test_no_preset_places_a_source_off_canvas(preset):
+    ids = ['s{}'.format(i) for i in range(7)]
+    cells = layout.resolve({'preset': preset, 'gap': 6}, 1280, 720, ids)
+    assert set(cells) == set(ids)
+    for source_id, cell in cells.items():
+        assert cell.x >= 0 and cell.y >= 0, source_id
+        assert cell.x + cell.width <= 1280, source_id
+        assert cell.y + cell.height <= 720, source_id
