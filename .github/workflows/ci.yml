@@ -1,0 +1,83 @@
+# Lint, unit tests, and the AI-marks check.
+#
+# The end-to-end check (make e2e) is deliberately not here: it brings up the
+# compose stack and publishes live RTMP for several seconds, which is the kind
+# of wall-clock-sensitive test that turns into a flaky required check. Run it
+# locally with `make test`.
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    # "edited" is what re-runs no-ai-marks when a pull request title or
+    # description changes. It re-runs the tests too, which is a little wasteful
+    # and much simpler than splitting the triggers across two workflows.
+    types: [opened, edited, reopened, synchronize]
+  merge_group:
+
+permissions:
+  contents: read
+
+# A new push supersedes whatever was still running for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # PyGObject and the GStreamer plugins come from apt for the same reason
+      # the Dockerfile installs them that way: gi has to match the system
+      # GObject introspection typelibs. The plugin set mirrors the Dockerfile
+      # -- test_pipeline.py asserts on elements from base, good, bad, ugly and
+      # libav, so a missing package here is a test failure, not a skip.
+      - name: Install PyGObject and GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3-gi \
+            python3-venv \
+            gir1.2-gstreamer-1.0 \
+            gir1.2-gst-plugins-base-1.0 \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav
+
+      # Ubuntu marks the system Python as externally managed (PEP 668), so the
+      # dev dependencies go into a venv. /usr/bin/python3 explicitly, rather
+      # than whichever python3 the runner image happens to put first on PATH:
+      # --system-site-packages only exposes gi if it is the interpreter apt
+      # installed it for. Putting the venv on PATH afterwards is what makes the
+      # Makefile's plain `python3` the venv's one in every later step.
+      - name: Create a virtualenv that can see the apt-installed PyGObject
+        run: |
+          /usr/bin/python3 -m venv --system-site-packages .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install development dependencies
+        run: make dev
+
+      - name: Lint
+        run: make lint
+
+      - name: Unit tests
+        run: make unit
+
+  no-ai-marks:
+    name: No AI marks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0          # the commit range needs history
+          persist-credentials: false
+      - uses: mishan/no-ai-marks@v0
