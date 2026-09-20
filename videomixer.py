@@ -199,13 +199,15 @@ class VideoMixer:
             log.warning('[%s] layout %s no longer resolves (%s); leaving '
                         'sources where they are', self.output_url,
                         self.layout, exc)
-            self.layout = None
+            self.clear_layout()
             return {}
         self._place(cells, self.layout, joining)
         return cells
 
     def clear_layout(self):
         """Stop tracking a layout. Sources stay exactly where they are."""
+        for source in list(self.sources.values()):
+            source.freeze_transition()
         self.layout = None
 
     def resolved_layout(self):
@@ -222,6 +224,11 @@ class VideoMixer:
                               list(self.sources))
 
     def _place(self, cells, spec, joining=None):
+        # An explicit cells layout may leave sources out. Their last layout
+        # must not keep moving them after it has been replaced.
+        for source_id, source in list(self.sources.items()):
+            if source_id not in cells:
+                source.freeze_transition()
         settings = transition.settings(spec)
         if settings is None:
             for source_id, cell in cells.items():
@@ -251,7 +258,7 @@ class VideoMixer:
             return
         log.info('[%s] %s of %s overrides layout %s; layout cleared',
                  self.output_url, what, source_id, self.layout)
-        self.layout = None
+        self.clear_layout()
 
     def get_info(self):
         return {

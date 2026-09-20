@@ -28,7 +28,8 @@ def test_plan_eases_geometry_and_fades_new_sources():
 
 @pytest.mark.parametrize('bad', [
     None, 1, {'duration': 0}, {'duration': 3}, {'duration': float('nan')},
-    {'duration': True}, {'duration': 'fast'}, {'easing': 'bounce'},
+    {'duration': True}, {'duration': 'fast'}, {'duration': 10 ** 400},
+    {'easing': 'bounce'},
     {'unknown': 1},
 ])
 def test_invalid_transition_rejects_the_layout(bad):
@@ -53,7 +54,7 @@ def test_bindings_interpolate_and_settle_on_real_compositor_pad(mixer):
     assert source._transition_bindings
     pad.sync_values(200_000_000)
     assert pad.get_property('width') == 210
-    source._settle_transition(source._transition_generation, pad,
+    source._finish_transition(source._transition_generation, pad,
                               mixer.resolved_layout()['a'])
     assert not source._transition_bindings
     assert pad.get_property('width') == 320
@@ -77,6 +78,98 @@ def test_interrupt_and_manual_edit_cancel_old_bindings(mixer):
     assert not source._transition_bindings
     assert pad.get_property('xpos') == 7
     assert mixer.layout is None
+
+
+def test_clearing_layout_freezes_in_flight_position(mixer):
+    source = _with_pad(mixer, 'a')
+    mixer.set_layout({'cells': [{'source': 'a', 'x': 200, 'y': 0,
+                                 'width': 100, 'height': 100}],
+                      'transition': {'duration': 0.4, 'easing': 'linear'}})
+    pad = source.compositor_pad
+    pad.sync_values(200_000_000)
+    midpoint = pad.get_property('xpos')
+    assert 0 < midpoint < 200
+    generation = source._transition_generation
+    mixer.clear_layout()
+    assert mixer.layout is None
+    assert not source._transition_bindings
+    assert source.xpos == pad.get_property('xpos') == midpoint
+    pad.sync_values(400_000_000)
+    assert pad.get_property('xpos') == midpoint
+    assert not source._settle_transition(generation, pad, None, 0)
+    assert pad.get_property('xpos') == midpoint
+
+
+def test_replacement_layout_freezes_an_omitted_source(mixer):
+    source = _with_pad(mixer, 'a')
+    _with_pad(mixer, 'b')
+    mixer.set_layout({'cells': [{'source': 'a', 'x': 200, 'y': 0,
+                                 'width': 100, 'height': 100}],
+                      'transition': {'duration': 0.4, 'easing': 'linear'}})
+    pad = source.compositor_pad
+    pad.sync_values(200_000_000)
+    midpoint = pad.get_property('xpos')
+    mixer.set_layout({'cells': [{'source': 'b', 'x': 20, 'y': 0,
+                                 'width': 100, 'height': 100}]})
+    assert not source._transition_bindings
+    assert source.xpos == pad.get_property('xpos') == midpoint
+    pad.sync_values(400_000_000)
+    assert pad.get_property('xpos') == midpoint
+
+
+def test_settlement_waits_for_pipeline_running_time(mixer, monkeypatch):
+    source = _with_pad(mixer, 'a')
+
+    class Clock:
+        now = 0
+
+        def get_time(self):
+            return self.now
+
+    class Pipeline:
+        state = Gst.State.PLAYING
+        clock = Clock()
+
+        def get_clock(self):
+            return self.clock
+
+        def get_base_time(self):
+            return 0
+
+        def get_state(self, timeout):
+            return None, self.state, None
+
+    scheduled = []
+
+    def timeout_add(interval, callback, *args):
+        scheduled.append((interval, callback, args))
+        return 1
+
+    monkeypatch.setattr('rtmpsource.GLib.timeout_add', timeout_add)
+    source.pipeline = Pipeline()
+    try:
+        mixer.set_layout({'cells': [{'source': 'a', 'x': 200, 'y': 0,
+                                     'width': 100, 'height': 100}],
+                          'transition': {'duration': 0.4, 'easing': 'linear'}})
+        _, callback, args = scheduled[-1]
+        source.pipeline.clock.now = 200_000_000
+        source.compositor_pad.sync_values(200_000_000)
+        assert source.compositor_pad.get_property('xpos') == 100
+
+        source.pipeline.state = Gst.State.PAUSED
+        assert callback(*args)
+        assert source._transition_bindings
+
+        source.pipeline.state = Gst.State.PLAYING
+        assert callback(*args)
+        assert source._transition_bindings
+
+        source.pipeline.clock.now = 500_000_000
+        assert not callback(*args)
+        assert not source._transition_bindings
+        assert source.compositor_pad.get_property('xpos') == 200
+    finally:
+        source.pipeline = mixer.pipeline
 
 
 def test_membership_changes_animate_existing_cells_and_remove_immediately(mixer):
@@ -127,7 +220,7 @@ def test_zorder_rises_before_animation_and_falls_after_settlement(mixer):
                'transition': {'duration': 0.4}}
     mixer.set_layout(falling)
     assert pad.get_property('zorder') == 3 + source.ZORDER_OFFSET
-    source._settle_transition(source._transition_generation, pad,
+    source._finish_transition(source._transition_generation, pad,
                               mixer.resolved_layout()['a'])
     assert pad.get_property('zorder') == source.ZORDER_OFFSET
 

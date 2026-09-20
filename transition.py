@@ -23,7 +23,8 @@ def settings(spec):
             ', '.join(sorted(unknown))))
     duration = value.get('duration', DEFAULT_DURATION)
     if (isinstance(duration, bool) or not isinstance(duration, (int, float))
-            or not math.isfinite(duration) or not 0 < duration <= MAX_DURATION):
+            or not 0 < duration <= MAX_DURATION
+            or not math.isfinite(duration)):
         raise ValueError('transition duration must be greater than 0 and at most 2 seconds')
     easing = value.get('easing', DEFAULT_EASING)
     if easing not in EASINGS:

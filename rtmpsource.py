@@ -482,6 +482,27 @@ class RtmpSource:
             self._transition_bindings = []
             self._pending_transition = None
 
+    def freeze_transition(self):
+        """Cancel an animation and retain the picture's current geometry."""
+        with self._lock:
+            if not self._transition_bindings and self._pending_transition is None:
+                return
+            pad = self.compositor_pad
+            if pad is None:
+                self._drop_transition()
+                return
+            current = {prop: pad.get_property(prop)
+                       for prop in transition.PROPERTIES}
+            zorder = pad.get_property('zorder') - self.ZORDER_OFFSET
+            self._drop_transition()
+            self.xpos = current['xpos']
+            self.ypos = current['ypos']
+            self.width = current['width'] or None
+            self.height = current['height'] or None
+            self.alpha = current['alpha']
+            self.zorder = zorder
+            self._apply_geometry()
+
     def current_transition_cell(self, canvas_width, canvas_height):
         """Read the live pad position, including an in-flight interpolation."""
         with self._lock:
@@ -532,18 +553,29 @@ class RtmpSource:
             self._apply_geometry()
             return
         generation = self._transition_generation
-        frame_ms = int(1000 / self.fps) + 1
+        frame_ns = int(Gst.SECOND / self.fps) + 1
         self._transition_timer = GLib.timeout_add(
-            int(duration * 1000) + frame_ms, self._settle_transition,
-            generation, pad, cell)
+            max(1, int(1000 / self.fps)), self._settle_transition,
+            generation, pad, cell, now + int(duration * Gst.SECOND) + frame_ns)
 
-    def _settle_transition(self, generation, pad, cell):
+    def _settle_transition(self, generation, pad, cell, end_time):
         with self._lock:
             if generation != self._transition_generation or pad is not self.compositor_pad:
                 return GLib.SOURCE_REMOVE
+            if self.pipeline.get_state(0)[1] != Gst.State.PLAYING:
+                return GLib.SOURCE_CONTINUE
+            clock = self.pipeline.get_clock()
+            if clock is None or clock.get_time() - self.pipeline.get_base_time() < end_time:
+                return GLib.SOURCE_CONTINUE
             self._transition_timer = None
-            self.set_cell(cell)
+            self._finish_transition(generation, pad, cell)
         return GLib.SOURCE_REMOVE
+
+    def _finish_transition(self, generation, pad, cell):
+        """Apply the endpoint after a timer has observed enough running time."""
+        with self._lock:
+            if generation == self._transition_generation and pad is self.compositor_pad:
+                self.set_cell(cell)
 
     def _store_cell(self, cell):
         self.xpos, self.ypos = cell.x, cell.y
