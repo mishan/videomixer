@@ -1,5 +1,7 @@
 """Keyframe arithmetic and the compositor binding lifecycle."""
 
+import threading
+
 import pytest
 import gi
 gi.require_version('Gst', '1.0')
@@ -241,6 +243,60 @@ def test_new_source_fades_and_reconnect_keeps_final_geometry(mixer):
     source._apply_geometry()
     assert source.compositor_pad.get_property('alpha') == 1.0
     assert source.compositor_pad.get_property('width') == 320
+
+
+def test_teardown_waits_for_binding_installation(mixer, monkeypatch):
+    source = _with_pad(mixer, 'a')
+    destination = layout.Cell(200, 10, 100, 100, 1, 'contain', 0.5)
+    frames = transition.plan({'a': source.current_transition_cell(320, 180)},
+                             {'a': destination}, 0.4, 'linear')['a']
+    installing = threading.Event()
+    proceed = threading.Event()
+    removing = threading.Event()
+    removed = threading.Event()
+    errors = []
+    apply_fit = source._apply_fit
+
+    def pause_during_install(pad):
+        installing.set()
+        assert proceed.wait(2)
+        apply_fit(pad)
+
+    def install():
+        try:
+            source.start_transition(frames, destination, 0.4)
+        except Exception as exc:
+            errors.append(exc)
+
+    def teardown():
+        removing.set()
+        try:
+            source._teardown_elements()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            removed.set()
+
+    monkeypatch.setattr(source, '_apply_fit', pause_during_install)
+    installer = threading.Thread(target=install)
+    remover = threading.Thread(target=teardown)
+    installer.start()
+    try:
+        assert installing.wait(2)
+        remover.start()
+        assert removing.wait(2)
+        assert not removed.wait(0.1), 'pad teardown overtook binding installation'
+    finally:
+        proceed.set()
+        installer.join(2)
+        if remover.ident is not None:
+            remover.join(2)
+
+    assert not installer.is_alive() and not remover.is_alive()
+    assert not errors
+    assert source.compositor_pad is None
+    assert not source._transition_bindings
+    assert source._transition_timer is None
 
 
 def test_frame_mid_transition_contains_the_moving_source(mixer):

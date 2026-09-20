@@ -449,8 +449,11 @@ class RtmpSource:
         the old one down -- cannot both release the same pad or remove the same
         element from the pipeline. Whoever loses gets an empty list.
         """
-        self._drop_transition()
         with self._lock:
+            # Installation and pad detachment use this same lock. Clearing
+            # bindings separately would let an installer add new ones after
+            # teardown had already claimed the pad for release.
+            self._drop_transition()
             elements = self.elements
             self.elements = []
             compositor_pad, self.compositor_pad = self.compositor_pad, None
@@ -519,44 +522,47 @@ class RtmpSource:
 
     def start_transition(self, frames, cell, duration, joining=False):
         """Install compositor control bindings for one planned cell change."""
-        awaiting_first_frame = self._pending_transition is not None
-        self._drop_transition()
-        self._store_cell(cell)
-        pad = self.compositor_pad
-        if pad is None:
-            if joining or awaiting_first_frame:
-                # A new publisher has no pad until its first decoded frame.
-                self._pending_transition = (frames, cell, duration)
-            return
+        with self._lock:
+            if self._closed:
+                return
+            awaiting_first_frame = self._pending_transition is not None
+            self._drop_transition()
+            self._store_cell(cell)
+            pad = self.compositor_pad
+            if pad is None:
+                if joining or awaiting_first_frame:
+                    # A new publisher has no pad until its first decoded frame.
+                    self._pending_transition = (frames, cell, duration)
+                return
 
-        self._apply_fit(pad)
-        if cell.zorder >= pad.get_property('zorder') - self.ZORDER_OFFSET:
-            pad.set_property('zorder', cell.zorder + self.ZORDER_OFFSET)
-        clock = self.pipeline.get_clock()
-        now = max(0, clock.get_time() - self.pipeline.get_base_time()) if clock else 0
-        for prop in transition.PROPERTIES:
-            points = frames.get(prop)
-            if not points:
-                pad.set_property(prop, getattr(self, prop))
-                continue
-            pad.set_property(prop, points[0][1])
-            control = GstController.InterpolationControlSource()
-            control.set_property('mode', GstController.InterpolationMode.LINEAR)
-            binding = GstController.DirectControlBinding.new_absolute(
-                pad, prop, control)
-            pad.add_control_binding(binding)
-            for offset, value in points:
-                control.set(now + int(offset * Gst.SECOND), value)
-            self._transition_bindings.append(binding)
+            self._apply_fit(pad)
+            if cell.zorder >= pad.get_property('zorder') - self.ZORDER_OFFSET:
+                pad.set_property('zorder', cell.zorder + self.ZORDER_OFFSET)
+            clock = self.pipeline.get_clock()
+            now = max(0, clock.get_time() - self.pipeline.get_base_time()) if clock else 0
+            for prop in transition.PROPERTIES:
+                points = frames.get(prop)
+                if not points:
+                    pad.set_property(prop, getattr(self, prop))
+                    continue
+                pad.set_property(prop, points[0][1])
+                control = GstController.InterpolationControlSource()
+                control.set_property('mode', GstController.InterpolationMode.LINEAR)
+                binding = GstController.DirectControlBinding.new_absolute(
+                    pad, prop, control)
+                pad.add_control_binding(binding)
+                for offset, value in points:
+                    control.set(now + int(offset * Gst.SECOND), value)
+                self._transition_bindings.append(binding)
 
-        if not self._transition_bindings:
-            self._apply_geometry()
-            return
-        generation = self._transition_generation
-        frame_ns = int(Gst.SECOND / self.fps) + 1
-        self._transition_timer = GLib.timeout_add(
-            max(1, int(1000 / self.fps)), self._settle_transition,
-            generation, pad, cell, now + int(duration * Gst.SECOND) + frame_ns)
+            if not self._transition_bindings:
+                self._apply_geometry()
+                return
+            generation = self._transition_generation
+            frame_ns = int(Gst.SECOND / self.fps) + 1
+            self._transition_timer = GLib.timeout_add(
+                max(1, int(1000 / self.fps)), self._settle_transition,
+                generation, pad, cell, now + int(duration * Gst.SECOND) + frame_ns)
 
     def _settle_transition(self, generation, pad, cell, end_time):
         with self._lock:
