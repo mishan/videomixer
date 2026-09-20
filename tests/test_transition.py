@@ -245,6 +245,83 @@ def test_new_source_fades_and_reconnect_keeps_final_geometry(mixer):
     assert source.compositor_pad.get_property('width') == 320
 
 
+def test_clear_before_first_frame_cancels_pending_fade(mixer):
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+    assert source._pending_transition is not None
+    mixer.clear_layout()
+    pad = source._attach_compositor_pad()
+    assert pad is not None
+    assert pad.get_property('alpha') == 1.0
+    assert not source._transition_bindings
+    assert source._transition_timer is None
+
+
+def test_replacement_before_first_frame_cancels_omitted_fade(mixer):
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+    assert source._pending_transition is not None
+    mixer.set_layout({'cells': []})
+    pad = source._attach_compositor_pad()
+    assert pad is not None
+    assert pad.get_property('alpha') == 1.0
+    assert not source._transition_bindings
+    assert source._transition_timer is None
+
+
+def test_clear_during_first_frame_cannot_restart_canceled_fade(mixer, monkeypatch):
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+    applied = threading.Event()
+    proceed = threading.Event()
+    clearing = threading.Event()
+    cleared = threading.Event()
+    errors = []
+    apply_geometry = source._apply_geometry
+
+    def pause_after_pending_is_cleared():
+        apply_geometry()
+        applied.set()
+        assert proceed.wait(2)
+
+    def attach():
+        try:
+            source._attach_compositor_pad()
+        except Exception as exc:
+            errors.append(exc)
+
+    def clear():
+        clearing.set()
+        try:
+            mixer.clear_layout()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            cleared.set()
+
+    monkeypatch.setattr(source, '_apply_geometry', pause_after_pending_is_cleared)
+    attaching = threading.Thread(target=attach)
+    canceling = threading.Thread(target=clear)
+    attaching.start()
+    try:
+        assert applied.wait(2)
+        canceling.start()
+        assert clearing.wait(2)
+        assert not cleared.wait(0.1), 'layout clear overtook first-frame setup'
+    finally:
+        proceed.set()
+        attaching.join(2)
+        if canceling.ident is not None:
+            canceling.join(2)
+
+    assert not attaching.is_alive() and not canceling.is_alive()
+    assert not errors
+    assert mixer.layout is None
+    assert source._pending_transition is None
+    assert not source._transition_bindings
+    assert source._transition_timer is None
+
+
 def test_teardown_waits_for_binding_installation(mixer, monkeypatch):
     source = _with_pad(mixer, 'a')
     destination = layout.Cell(200, 10, 100, 100, 1, 'contain', 0.5)

@@ -245,22 +245,9 @@ class RtmpSource:
         scale = self._make('videoscale')
         rate = self._make('videorate')
 
-        pad_template = self.compositor.get_pad_template('sink_%u')
-        self.compositor_pad = self.compositor.request_pad(pad_template,
-                                                          None, None)
-        if self.compositor_pad is None:
-            log.error('[%s] could not obtain a compositor sink pad',
-                      self.location)
+        compositor_pad = self._attach_compositor_pad()
+        if compositor_pad is None:
             return
-
-        self._align_to_running_time(self.compositor_pad)
-        # Geometry lives on the source, not on the pad, so a pad obtained after
-        # a reconnect gets the layout the source had before it dropped.
-        pending = self._pending_transition
-        self._apply_geometry()
-        if pending is not None:
-            frames, cell, duration = pending
-            self.start_transition(frames, cell, duration)
 
         if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
             log.error('[%s] could not link decoded video pad', self.location)
@@ -269,8 +256,31 @@ class RtmpSource:
             log.error('[%s] could not link video conversion chain',
                       self.location)
             return
-        if rate.get_static_pad('src').link(self.compositor_pad) != Gst.PadLinkReturn.OK:
+        if rate.get_static_pad('src').link(compositor_pad) != Gst.PadLinkReturn.OK:
             log.error('[%s] could not link into compositor', self.location)
+
+    def _attach_compositor_pad(self):
+        """Apply stored geometry and consume a first-frame fade atomically."""
+        with self._lock:
+            if self._closed:
+                return None
+            pad_template = self.compositor.get_pad_template('sink_%u')
+            pad = self.compositor.request_pad(pad_template, None, None)
+            if pad is None:
+                log.error('[%s] could not obtain a compositor sink pad',
+                          self.location)
+                return None
+            self.compositor_pad = pad
+            self._align_to_running_time(pad)
+            # Geometry lives on the source, not the pad, so reconnects restore
+            # it. The pending fade must be consumed under this same lock: a
+            # layout clear cannot cancel it between this read and installation.
+            pending = self._pending_transition
+            self._apply_geometry()
+            if pending is not None:
+                frames, cell, duration = pending
+                self.start_transition(frames, cell, duration)
+            return pad
 
     def _on_audio_decoded(self, decodebin, pad):
         caps = pad.get_current_caps()
