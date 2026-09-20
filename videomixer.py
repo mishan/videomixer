@@ -65,6 +65,8 @@ class VideoMixer:
     def __init__(self, output_url, width=1280, height=720, fps=30,
                  video_bitrate=2500, audio_bitrate=128):
         self.sources = {}
+        # Sources removed from layout membership but still fading on air.
+        self._retiring_sources = {}
         # The layout spec currently in force, or None while geometry is being
         # driven one source at a time through move/resize. It is kept as the
         # spec rather than as resolved rectangles because it has to be
@@ -117,6 +119,12 @@ class VideoMixer:
             except Exception:
                 log.exception('Error removing source %s', source_id)
         self.sources.clear()
+        for source in list(self._retiring_sources.values()):
+            try:
+                source.remove()
+            except Exception:
+                log.exception('Error removing fading source %s', source.location)
+        self._retiring_sources.clear()
         if self.bus_watch_id is not None:
             GLib.source_remove(self.bus_watch_id)
             self.bus_watch_id = None
@@ -129,6 +137,11 @@ class VideoMixer:
                         alpha=1.0):
         if source_id in self.sources:
             raise ValueError('source_id={} already exists'.format(source_id))
+        # An ID becomes available as soon as removal is requested. A quick
+        # re-add cuts short the old fade so two pads with that ID cannot overlap.
+        retiring = self._retiring_sources.pop(source_id, None)
+        if retiring is not None:
+            retiring.remove()
         source = rtmpsource.RtmpSource(location, self.pipeline,
                                        self.compositor, self.audiomixer,
                                        xpos, ypos, zorder, width, height,
@@ -141,10 +154,30 @@ class VideoMixer:
         return source
 
     def remove_rtmp_source(self, source_id):
-        self._get(source_id).remove()
+        source = self._get(source_id)
+        settings = transition.settings(self.layout) if self.layout is not None else None
+        fading = False
+        if settings is not None:
+            duration, easing = settings
+            self._retiring_sources[source_id] = source
+            try:
+                fading = source.fade_out_then_remove(
+                    duration, easing, self.width, self.height,
+                    lambda: self._finish_retiring_source(source_id, source))
+            finally:
+                if not fading:
+                    self._retiring_sources.pop(source_id, None)
+        if not fading:
+            source.remove()
         del self.sources[source_id]
         # The remaining sources close the gap: a 4-up becomes a 3-up.
         self.apply_layout()
+
+    def _finish_retiring_source(self, source_id, source):
+        if self._retiring_sources.get(source_id) is not source:
+            return
+        source.remove()
+        self._retiring_sources.pop(source_id, None)
 
     def resize_rtmp_source(self, source_id, width, height):
         self._get(source_id).resize(width, height)
@@ -417,7 +450,8 @@ class VideoMixer:
             # Snapshot the sources: the API adds and removes them from the
             # aiohttp thread while this runs on the bus watch thread. Ownership
             # itself is queried under each source's own lock.
-            for source in list(self.sources.values()):
+            for source in (list(self.sources.values()) +
+                           list(self._retiring_sources.values())):
                 if source.owns(obj):
                     return source
             obj = obj.get_parent()

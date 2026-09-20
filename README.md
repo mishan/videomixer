@@ -148,9 +148,11 @@ leaving also animate the remaining cells:
 Duration is in seconds, greater than zero and at most 2. The default is 0.4.
 Easing may be `linear`, `ease-in`, `ease-out`, or `ease-in-out` (the default).
 Without `transition`, layout changes remain immediate. A newly joined source
-fades in at its destination; removal is immediate. Moving, resizing, changing
-fit, or changing opacity by hand cancels that source's animation and clears
-the tracked layout.
+fades in at its destination. Removing a visible source takes it out of the
+layout immediately, then fades its video out before releasing its pad; sources
+without a playing video pad are removed immediately. Re-adding the same ID
+ends any outgoing fade. Moving, resizing, changing fit, or changing opacity by
+hand cancels that source's animation and clears the tracked layout.
 
 ### Presets
 

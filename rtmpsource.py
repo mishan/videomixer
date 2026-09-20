@@ -117,6 +117,8 @@ class RtmpSource:
         self._transition_timer = None
         self._transition_generation = 0
         self._pending_transition = None
+        self._retire_callback = None
+        self._retire_scheduled = False
         self.state = CONNECTING
         self.reconnect_attempts = 0
         self.last_error = None
@@ -364,6 +366,13 @@ class RtmpSource:
         deadlocks.
         """
         with self._lock:
+            if self._retire_callback is not None:
+                # A fading source is no longer part of the layout. If its
+                # publisher disappears, finish removal instead of reconnecting.
+                if not self._retire_scheduled:
+                    self._retire_scheduled = True
+                    GLib.idle_add(self._complete_retirement)
+                return
             # Guard on a rebuild already being in flight rather than on the
             # state: once a retry is armed the state stays RECONNECTING, and
             # keying off that would swallow the failure of the retry itself
@@ -530,6 +539,40 @@ class RtmpSource:
                 values['height'] = float(self.video_height or canvas_height)
             return values
 
+    def fade_out_then_remove(self, duration, easing, canvas_width,
+                             canvas_height, on_complete):
+        """Fade an on-air pad in place, then let the owner release this source.
+
+        Returns false when there is no visible, running pad to fade. The owner
+        then tears down immediately, as it did before transitions existed.
+        """
+        with self._lock:
+            if (self._closed or self._rebuilding or self.compositor_pad is None
+                    or self.pipeline.get_state(0)[1] != Gst.State.PLAYING
+                    or self.pipeline.get_clock() is None):
+                return False
+            self.freeze_transition()
+            current = self.current_transition_cell(canvas_width, canvas_height)
+            if current['alpha'] <= 0:
+                return False
+            cell = layout.Cell(int(current['xpos']), int(current['ypos']),
+                               int(current['width']), int(current['height']),
+                               self.zorder, self.fit, 0.0)
+            frames = transition.plan({'source': current}, {'source': cell},
+                                     duration, easing)['source']
+            self.start_transition(frames, cell, duration)
+            self._retire_callback = on_complete
+            return True
+
+    def _complete_retirement(self):
+        with self._lock:
+            callback = self._retire_callback
+            self._retire_callback = None
+            self._retire_scheduled = False
+        if callback is not None:
+            callback()
+        return GLib.SOURCE_REMOVE
+
     def start_transition(self, frames, cell, duration, joining=False):
         """Install compositor control bindings for one planned cell change."""
         with self._lock:
@@ -585,6 +628,9 @@ class RtmpSource:
                 return GLib.SOURCE_CONTINUE
             self._transition_timer = None
             self._finish_transition(generation, pad, cell)
+            retiring = self._retire_callback is not None
+        if retiring:
+            self._complete_retirement()
         return GLib.SOURCE_REMOVE
 
     def _finish_transition(self, generation, pad, cell):
@@ -678,6 +724,7 @@ class RtmpSource:
         log.info('Removing RTMP source %s', self.location)
         with self._lock:
             self._closed = True
+            self._retire_callback = None
             if self._reconnect_timer is not None:
                 GLib.source_remove(self._reconnect_timer)
                 self._reconnect_timer = None
