@@ -47,6 +47,33 @@ def _with_pad(mixer, source_id):
     return source
 
 
+class _RunningPipeline:
+    """A controllable clock around the mixer's unplayed test pipeline."""
+
+    def __init__(self, pipeline):
+        self.real = pipeline
+        self.now = 0
+        self.state = Gst.State.PLAYING
+
+    def get_state(self, timeout):
+        return None, self.state, None
+
+    def get_clock(self):
+        return self
+
+    def get_time(self):
+        return self.now
+
+    def get_base_time(self):
+        return 0
+
+    def remove(self, element):
+        return self.real.remove(element)
+
+    def add(self, element):
+        return self.real.add(element)
+
+
 def test_bindings_interpolate_and_settle_on_real_compositor_pad(mixer):
     source = _with_pad(mixer, 'a')
     source.resize(100, 80)
@@ -376,6 +403,202 @@ def test_teardown_waits_for_binding_installation(mixer, monkeypatch):
     assert source._transition_timer is None
 
 
+def test_removal_fades_then_releases_the_pad(mixer, monkeypatch):
+    source = _with_pad(mixer, 'a')
+    audio_template = mixer.audiomixer.get_pad_template('sink_%u')
+    audio_pad = mixer.audiomixer.request_pad(audio_template, None, None)
+    source.audiomixer_pad = audio_pad
+    mixer.set_layout({'preset': 'grid', 'transition': {
+        'duration': 0.4, 'easing': 'linear'}})
+    source.pipeline = _RunningPipeline(mixer.pipeline)
+    timers = {}
+
+    def timeout_add(interval, callback, *args):
+        timer_id = len(timers) + 1
+        timers[timer_id] = callback, args
+        return timer_id
+
+    monkeypatch.setattr('rtmpsource.GLib.timeout_add', timeout_add)
+    pad = source.compositor_pad
+    mixer.remove_rtmp_source('a')
+    assert 'a' not in mixer.sources
+    assert mixer._retiring_sources['a'] is source
+    assert mixer._source_for(source.rtmp_src) is source
+    assert source.compositor_pad is pad
+    assert source.audiomixer_pad is audio_pad
+    assert audio_pad.get_property('mute')
+    assert source._transition_bindings
+    callback, args = timers[source._transition_timer]
+
+    pad.sync_values(200_000_000)
+    assert pad.get_property('alpha') == pytest.approx(0.5)
+    source.pipeline.now = 200_000_000
+    assert callback(*args)
+    assert source.compositor_pad is pad
+
+    source.pipeline.state = Gst.State.PAUSED
+    source.pipeline.now = 500_000_000
+    assert callback(*args)
+    assert source.compositor_pad is pad
+
+    source.pipeline.state = Gst.State.PLAYING
+    assert not callback(*args)
+    assert source.compositor_pad is None
+    assert source.audiomixer_pad is None
+    assert source._closed
+    assert not mixer._retiring_sources
+
+
+def test_audio_arriving_after_removal_stays_muted(mixer):
+    source = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+
+    class DecodedPad:
+        def get_current_caps(self):
+            return Gst.Caps.from_string('audio/x-raw,rate=44100,channels=2')
+
+        def link(self, sink):
+            return Gst.PadLinkReturn.OK
+
+    source._on_audio_decoded(None, DecodedPad())
+    assert source.audiomixer_pad is not None
+    assert source.audiomixer_pad.get_property('mute')
+
+
+def test_remaining_cells_reshape_while_departing_source_fades(mixer):
+    departing = _with_pad(mixer, 'a')
+    remaining = _with_pad(mixer, 'b')
+    mixer.set_layout({'preset': 'row'})
+    mixer.set_layout({'preset': 'row', 'transition': {'duration': 0.4}})
+    departing.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    assert departing.compositor_pad is not None
+    assert departing in mixer._retiring_sources.values()
+    assert remaining.width == 320
+    assert remaining._transition_bindings
+
+
+def test_shutdown_releases_a_source_still_fading(mixer):
+    source = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    mixer.shutdown()
+    assert source._closed
+    assert source.compositor_pad is None
+    assert not mixer._retiring_sources
+
+
+def test_removal_without_a_playing_pad_is_immediate(mixer):
+    source = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    mixer.remove_rtmp_source('a')
+    assert source._closed
+    assert not mixer.sources
+    assert not mixer._retiring_sources
+
+
+def test_removing_an_already_hidden_source_is_immediate(mixer):
+    source = _with_pad(mixer, 'a')
+    source.set_alpha(0.0)
+    mixer.set_layout({'cells': [{'source': 'a', 'x': 0, 'y': 0,
+                                 'width': 320, 'height': 180, 'alpha': 0.0}],
+                      'transition': {'duration': 0.4}})
+    source.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    assert source._closed
+    assert not mixer._retiring_sources
+
+
+def test_readding_an_id_cancels_its_old_fade(mixer):
+    old = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    old.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    assert old.compositor_pad is not None
+    new = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+    assert new is not old
+    assert old._closed and old.compositor_pad is None
+    assert not mixer._retiring_sources
+
+
+def test_retirement_completion_cannot_discard_new_removal(mixer, monkeypatch):
+    old = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    old.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    added = threading.Event()
+    new_sources = []
+    errors = []
+    real_remove = old.remove
+
+    def slow_remove():
+        entered.set()
+        if not proceed.wait(2):
+            raise AssertionError('retirement teardown was not released')
+        real_remove()
+
+    def finish():
+        try:
+            mixer._finish_retiring_source('a', old)
+        except Exception as exc:
+            errors.append(exc)
+
+    def readd():
+        try:
+            new_sources.append(mixer.add_rtmp_source('a', DEAD_RTMP_URL))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            added.set()
+
+    monkeypatch.setattr(old, 'remove', slow_remove)
+    finisher = threading.Thread(target=finish)
+    adder = threading.Thread(target=readd)
+    try:
+        finisher.start()
+        assert entered.wait(2)
+        adder.start()
+        assert not added.wait(0.1)
+    finally:
+        proceed.set()
+        finisher.join(2)
+        if adder.ident is not None:
+            adder.join(2)
+
+    assert not finisher.is_alive() and not adder.is_alive()
+    assert not errors
+    new = new_sources[0]
+    new.compositor_pad = mixer.compositor.request_pad(
+        mixer.compositor.get_pad_template('sink_%u'), None, None)
+    new._apply_geometry()
+    new.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    assert mixer._retiring_sources['a'] is new
+
+
+def test_disconnect_during_fade_finishes_removal_without_reconnect(
+        mixer, monkeypatch):
+    source = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    callbacks = []
+    monkeypatch.setattr('rtmpsource.GLib.idle_add',
+                        lambda callback: callbacks.append(callback) or 1)
+    source.handle_disconnect('publisher ended')
+    assert len(callbacks) == 1
+    callbacks[0]()
+    assert source._closed
+    assert source.reconnect_attempts == 0
+    assert not mixer._retiring_sources
+
+
 def test_frame_mid_transition_contains_the_moving_source(mixer):
     """Inspect actual output pixels, including the frame between endpoints."""
     source = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
@@ -429,6 +652,64 @@ def test_frame_mid_transition_contains_the_moving_source(mixer):
         assert positions[0] <= 2
         assert 22 <= positions[4] <= 38
         assert positions[10] >= 58
+    finally:
+        source._drop_transition()
+        pipeline.set_state(Gst.State.NULL)
+        source.compositor_pad = None
+        source.pipeline = mixer.pipeline
+        source.compositor = mixer.compositor
+
+
+def test_frame_mid_fade_is_visibly_between_white_and_black(mixer):
+    source = mixer.add_rtmp_source('a', DEAD_RTMP_URL)
+    pipeline = Gst.Pipeline.new('fade-frames')
+
+    def element(factory):
+        item = Gst.ElementFactory.make(factory, None)
+        assert item is not None
+        pipeline.add(item)
+        return item
+
+    image = element('videotestsrc')
+    image.set_property('pattern', 'white')
+    image.set_property('num-buffers', 14)
+    image_caps = element('capsfilter')
+    image_caps.set_property('caps', Gst.Caps.from_string(
+        'video/x-raw,format=RGB,width=40,height=40,framerate=20/1'))
+    compositor = element('compositor')
+    compositor.set_property('background', 'black')
+    convert = element('videoconvert')
+    output_caps = element('capsfilter')
+    output_caps.set_property('caps', Gst.Caps.from_string(
+        'video/x-raw,format=RGB,width=40,height=40,framerate=20/1'))
+    sink = element('appsink')
+    sink.set_property('sync', False)
+    assert image.link(image_caps)
+    pad = compositor.request_pad(compositor.get_pad_template('sink_%u'),
+                                 None, None)
+    assert image_caps.get_static_pad('src').link(pad) == Gst.PadLinkReturn.OK
+    assert compositor.link(convert) and convert.link(output_caps)
+    assert output_caps.link(sink)
+
+    source.pipeline = pipeline
+    source.compositor = compositor
+    source.compositor_pad = pad
+    source.set_cell(layout.Cell(0, 0, 40, 40, 1, 'fill', 1.0))
+    destination = layout.Cell(0, 0, 40, 40, 1, 'fill', 0.0)
+    frames = transition.plan({'a': source.current_transition_cell(40, 40)},
+                             {'a': destination}, 0.4, 'linear')['a']
+    source.start_transition(frames, destination, 0.4)
+    try:
+        assert pipeline.set_state(Gst.State.PLAYING) != Gst.StateChangeReturn.FAILURE
+        brightness = []
+        for _ in range(14):
+            sample = sink.emit('try-pull-sample', Gst.SECOND)
+            assert sample is not None
+            data = sample.get_buffer().extract_dup(0, 40 * 40 * 3)
+            brightness.append(data[(20 * 40 + 20) * 3])
+        assert brightness[0] > 230
+        assert 90 < brightness[4] < 180
+        assert brightness[10] < 10
     finally:
         source._drop_transition()
         pipeline.set_state(Gst.State.NULL)
