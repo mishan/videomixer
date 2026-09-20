@@ -565,3 +565,61 @@ async def test_layout_is_a_reserved_source_id(client):
     assert resp.status == 409
     assert 'reserved' in (await resp.json())['error']
     assert 'layout' not in FakeMixer.instances[-1].sources
+
+
+# --- a body that is not a JSON object -------------------------------------
+
+BODY_ENDPOINTS = [
+    ('create', 'put', '/stream/other'),
+    ('add source', 'put', '/stream/s1/new'),
+    ('set layout', 'put', '/stream/s1/layout'),
+    ('resize', 'post', '/stream/s1/resize/cam'),
+    ('move', 'post', '/stream/s1/move/cam'),
+    ('fit', 'post', '/stream/s1/fit/cam'),
+    ('alpha', 'post', '/stream/s1/alpha/cam'),
+]
+
+# Raw text rather than json=, because aiohttp's json=None does not put the
+# four characters "null" on the wire, which is exactly the case under test.
+NON_OBJECT_BODIES = ['null', '5', 'true', '["a"]', '"hello"']
+
+
+@pytest.mark.parametrize('label,method,path', BODY_ENDPOINTS)
+@pytest.mark.parametrize('body', NON_OBJECT_BODIES)
+async def test_a_non_object_body_is_400_not_500(client, label, method, path,
+                                                body):
+    """Handlers treat the parsed body as a mapping.
+
+    A JSON scalar is valid JSON but not a mapping, so `'field' in body` raised
+    TypeError and a malformed request came back as a 500. A JSON array or
+    string was worse: membership tests against them succeed, so the body was
+    read as "every field absent" and nonsense came back 200.
+    """
+    await create_stream(client, 's1')
+    await client.put('/stream/s1/cam', json={'stream_uri': 'rtmp://i/c'})
+    resp = await getattr(client, method)(
+        path, data=body, headers={'Content-Type': 'application/json'})
+    assert resp.status == 400, '{} with {} gave {}'.format(
+        label, body, resp.status)
+    assert 'JSON object' in (await resp.json())['error']
+
+
+async def test_a_list_body_is_not_read_as_every_field_absent(client):
+    """move accepts every field as optional, so a list body used to 200."""
+    await create_stream(client, 's1')
+    await client.put('/stream/s1/cam',
+                     json={'stream_uri': 'rtmp://i/c', 'x': 1, 'y': 2, 'z': 3})
+    resp = await client.post('/stream/s1/move/cam', data='["x"]',
+                             headers={'Content-Type': 'application/json'})
+    assert resp.status == 400
+    assert not [c for c in FakeMixer.instances[-1].calls if c[0] == 'move']
+
+
+async def test_an_empty_object_is_still_a_valid_body(client):
+    """Rejecting non-objects must not reject a body with nothing in it."""
+    await create_stream(client, 's1')
+    await client.put('/stream/s1/cam',
+                     json={'stream_uri': 'rtmp://i/c', 'x': 1, 'y': 2, 'z': 3})
+    resp = await client.post('/stream/s1/move/cam', json={})
+    assert resp.status == 200
+    assert ('move', 'cam', 1, 2, 3) in FakeMixer.instances[-1].calls

@@ -120,10 +120,23 @@ class MixerApi:
 
     @staticmethod
     async def _body(request):
+        """The request body, guaranteed to be a JSON object.
+
+        Every handler treats what comes back as a mapping. A JSON scalar is
+        valid JSON but not a mapping, so `'field' in body` raised TypeError
+        and the handler answered a malformed request with a 500. A JSON array
+        or string is worse than that: membership tests against them succeed,
+        so the body was quietly read as "every field absent" and a request
+        that was nonsense came back 200.
+        """
         try:
-            return await request.json()
+            body = await request.json()
         except ValueError:
             _abort('invalid JSON body')
+        if not isinstance(body, dict):
+            _abort('request body must be a JSON object, not {}'.format(
+                type(body).__name__ if body is not None else 'null'))
+        return body
 
     # -- handlers ----------------------------------------------------------
 
