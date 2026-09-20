@@ -70,6 +70,9 @@ class _RunningPipeline:
     def remove(self, element):
         return self.real.remove(element)
 
+    def add(self, element):
+        return self.real.add(element)
+
 
 def test_bindings_interpolate_and_settle_on_real_compositor_pad(mixer):
     source = _with_pad(mixer, 'a')
@@ -402,6 +405,9 @@ def test_teardown_waits_for_binding_installation(mixer, monkeypatch):
 
 def test_removal_fades_then_releases_the_pad(mixer, monkeypatch):
     source = _with_pad(mixer, 'a')
+    audio_template = mixer.audiomixer.get_pad_template('sink_%u')
+    audio_pad = mixer.audiomixer.request_pad(audio_template, None, None)
+    source.audiomixer_pad = audio_pad
     mixer.set_layout({'preset': 'grid', 'transition': {
         'duration': 0.4, 'easing': 'linear'}})
     source.pipeline = _RunningPipeline(mixer.pipeline)
@@ -419,6 +425,8 @@ def test_removal_fades_then_releases_the_pad(mixer, monkeypatch):
     assert mixer._retiring_sources['a'] is source
     assert mixer._source_for(source.rtmp_src) is source
     assert source.compositor_pad is pad
+    assert source.audiomixer_pad is audio_pad
+    assert audio_pad.get_property('mute')
     assert source._transition_bindings
     callback, args = timers[source._transition_timer]
 
@@ -436,8 +444,27 @@ def test_removal_fades_then_releases_the_pad(mixer, monkeypatch):
     source.pipeline.state = Gst.State.PLAYING
     assert not callback(*args)
     assert source.compositor_pad is None
+    assert source.audiomixer_pad is None
     assert source._closed
     assert not mixer._retiring_sources
+
+
+def test_audio_arriving_after_removal_stays_muted(mixer):
+    source = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    source.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+
+    class DecodedPad:
+        def get_current_caps(self):
+            return Gst.Caps.from_string('audio/x-raw,rate=44100,channels=2')
+
+        def link(self, sink):
+            return Gst.PadLinkReturn.OK
+
+    source._on_audio_decoded(None, DecodedPad())
+    assert source.audiomixer_pad is not None
+    assert source.audiomixer_pad.get_property('mute')
 
 
 def test_remaining_cells_reshape_while_departing_source_fades(mixer):
@@ -495,6 +522,64 @@ def test_readding_an_id_cancels_its_old_fade(mixer):
     assert new is not old
     assert old._closed and old.compositor_pad is None
     assert not mixer._retiring_sources
+
+
+def test_retirement_completion_cannot_discard_new_removal(mixer, monkeypatch):
+    old = _with_pad(mixer, 'a')
+    mixer.set_layout({'preset': 'grid', 'transition': {'duration': 0.4}})
+    old.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    added = threading.Event()
+    new_sources = []
+    errors = []
+    real_remove = old.remove
+
+    def slow_remove():
+        entered.set()
+        if not proceed.wait(2):
+            raise AssertionError('retirement teardown was not released')
+        real_remove()
+
+    def finish():
+        try:
+            mixer._finish_retiring_source('a', old)
+        except Exception as exc:
+            errors.append(exc)
+
+    def readd():
+        try:
+            new_sources.append(mixer.add_rtmp_source('a', DEAD_RTMP_URL))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            added.set()
+
+    monkeypatch.setattr(old, 'remove', slow_remove)
+    finisher = threading.Thread(target=finish)
+    adder = threading.Thread(target=readd)
+    try:
+        finisher.start()
+        assert entered.wait(2)
+        adder.start()
+        assert not added.wait(0.1)
+    finally:
+        proceed.set()
+        finisher.join(2)
+        if adder.ident is not None:
+            adder.join(2)
+
+    assert not finisher.is_alive() and not adder.is_alive()
+    assert not errors
+    new = new_sources[0]
+    new.compositor_pad = mixer.compositor.request_pad(
+        mixer.compositor.get_pad_template('sink_%u'), None, None)
+    new._apply_geometry()
+    new.pipeline = _RunningPipeline(mixer.pipeline)
+    mixer.remove_rtmp_source('a')
+    assert mixer._retiring_sources['a'] is new
 
 
 def test_disconnect_during_fade_finishes_removal_without_reconnect(

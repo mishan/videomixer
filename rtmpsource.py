@@ -118,6 +118,7 @@ class RtmpSource:
         self._transition_generation = 0
         self._pending_transition = None
         self._retire_callback = None
+        self._retiring = False
         self._retire_scheduled = False
         self.state = CONNECTING
         self.reconnect_attempts = 0
@@ -289,31 +290,37 @@ class RtmpSource:
         if caps is None or not caps.get_structure(0).get_name().startswith('audio'):
             return
         log.info('[%s] decoded audio', self.location)
+        with self._lock:
+            if self._closed:
+                return
+            convert = self._make('audioconvert')
+            resample = self._make('audioresample')
+            capsfilter = self._make('capsfilter')
+            capsfilter.set_property('caps', Gst.Caps.from_string(AUDIO_CAPS))
 
-        convert = self._make('audioconvert')
-        resample = self._make('audioresample')
-        capsfilter = self._make('capsfilter')
-        capsfilter.set_property('caps', Gst.Caps.from_string(AUDIO_CAPS))
+            pad_template = self.audiomixer.get_pad_template('sink_%u')
+            self.audiomixer_pad = self.audiomixer.request_pad(pad_template,
+                                                              None, None)
+            if self.audiomixer_pad is None:
+                log.error('[%s] could not obtain an audiomixer sink pad',
+                          self.location)
+                return
 
-        pad_template = self.audiomixer.get_pad_template('sink_%u')
-        self.audiomixer_pad = self.audiomixer.request_pad(pad_template,
-                                                          None, None)
-        if self.audiomixer_pad is None:
-            log.error('[%s] could not obtain an audiomixer sink pad',
-                      self.location)
-            return
+            # Audio may finish decoding after layout removal began. Keep the
+            # pad silent before it can deliver a buffer to the mixer.
+            if self._retiring:
+                self.audiomixer_pad.set_property('mute', True)
+            self._align_to_running_time(self.audiomixer_pad)
 
-        self._align_to_running_time(self.audiomixer_pad)
-
-        if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
-            log.error('[%s] could not link decoded audio pad', self.location)
-            return
-        if not convert.link(resample) or not resample.link(capsfilter):
-            log.error('[%s] could not link audio conversion chain',
-                      self.location)
-            return
-        if capsfilter.get_static_pad('src').link(self.audiomixer_pad) != Gst.PadLinkReturn.OK:
-            log.error('[%s] could not link into audiomixer', self.location)
+            if pad.link(convert.get_static_pad('sink')) != Gst.PadLinkReturn.OK:
+                log.error('[%s] could not link decoded audio pad', self.location)
+                return
+            if not convert.link(resample) or not resample.link(capsfilter):
+                log.error('[%s] could not link audio conversion chain',
+                          self.location)
+                return
+            if capsfilter.get_static_pad('src').link(self.audiomixer_pad) != Gst.PadLinkReturn.OK:
+                log.error('[%s] could not link into audiomixer', self.location)
 
     # -- connection lifecycle ----------------------------------------------
 
@@ -561,6 +568,9 @@ class RtmpSource:
             frames = transition.plan({'source': current}, {'source': cell},
                                      duration, easing)['source']
             self.start_transition(frames, cell, duration)
+            self._retiring = True
+            if self.audiomixer_pad is not None:
+                self.audiomixer_pad.set_property('mute', True)
             self._retire_callback = on_complete
             return True
 
