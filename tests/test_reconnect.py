@@ -206,11 +206,37 @@ def test_reconnecting_rebuilds_the_elements(source, scheduler):
 
 
 def test_geometry_survives_a_reconnect(source, scheduler):
-    """The layer has to come back where the caller put it."""
+    """The layer has to come back where the layout put it."""
+    source.set_fit('fill')
+    source.set_alpha(0.5)
     source.handle_disconnect('gone')
     scheduler.fire_last()
     assert (source.xpos, source.ypos, source.zorder) == (10, 20, 3)
     assert (source.width, source.height) == (160, 90)
+    assert (source.fit, source.alpha) == ('fill', 0.5)
+
+
+def test_geometry_is_reapplied_to_the_pad_obtained_on_reconnect(mixer, source,
+                                                                scheduler):
+    """Geometry lives on the source, not on the compositor pad.
+
+    The pad is released when the publisher drops and a fresh one is requested
+    on the way back, so state kept only on the pad would be lost with it and
+    the layer would return full-frame in the top-left corner.
+    """
+    simulate_stream_arriving(mixer, source)
+    source.handle_disconnect('gone')
+    scheduler.fire_last()
+    assert source.compositor_pad is None, 'the old pad should have been released'
+
+    # Stand in for _on_video_decoded, which is what re-requests the pad once
+    # the rebuilt branch starts producing frames.
+    simulate_stream_arriving(mixer, source)
+    source._apply_geometry()
+    pad = source.compositor_pad
+    assert (pad.get_property('xpos'), pad.get_property('ypos')) == (10, 20)
+    assert (pad.get_property('width'), pad.get_property('height')) == (160, 90)
+    assert pad.get_property('zorder') == 3 + rtmpsource.RtmpSource.ZORDER_OFFSET
 
 
 def test_recovery_clears_the_error_and_attempt_count(source, scheduler):

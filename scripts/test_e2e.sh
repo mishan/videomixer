@@ -20,7 +20,9 @@ RECORD_TIMEOUT="${RECORD_TIMEOUT:-8}"
 # How long to let each stage settle. Lower these to speed up a local run.
 SETTLE_PUBLISH="${SETTLE_PUBLISH:-5}"
 SETTLE_CREATE="${SETTLE_CREATE:-5}"
-SETTLE_PIP="${SETTLE_PIP:-8}"
+SETTLE_SOURCE="${SETTLE_SOURCE:-8}"
+# How long to let a layout change settle before recording.
+SETTLE_LAYOUT="${SETTLE_LAYOUT:-3}"
 WORKDIR="$(mktemp -d)"
 PIDS=()
 
@@ -38,6 +40,7 @@ need ffmpeg
 need ffprobe
 need curl
 need timeout
+need python3   # the layout check below parses the API's JSON
 
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$*"; }
@@ -87,16 +90,44 @@ grep -q '"status": "OK"' "$WORKDIR/create.json" || fail "could not create stream
 pass "stream created"
 sleep "$SETTLE_CREATE"
 
-say "Adding a picture-in-picture to the running stream"
+say "Adding a second source to the running stream"
 curl -sf -H 'Content-Type: application/json' -X PUT \
     -d "{\"stream_uri\":\"$RTMP_NET_URL/cam\",
          \"x\":400,\"y\":220,\"z\":10,\"width\":200,\"height\":112}" \
-    "$API/stream/$STREAM_ID/cam1" >"$WORKDIR/pip.json" \
-    || fail "PiP request failed"
-sed 's/^/  /' "$WORKDIR/pip.json"; echo
-grep -q '"status": "OK"' "$WORKDIR/pip.json" || fail "could not add PiP"
-pass "PiP added without restarting the pipeline"
-sleep "$SETTLE_PIP"
+    "$API/stream/$STREAM_ID/cam1" >"$WORKDIR/source.json" \
+    || fail "add-source request failed"
+sed 's/^/  /' "$WORKDIR/source.json"; echo
+grep -q '"status": "OK"' "$WORKDIR/source.json" || fail "could not add source"
+pass "source added without restarting the pipeline"
+sleep "$SETTLE_SOURCE"
+
+say "Relaying out the running stream"
+# The stream is 640x360 with two sources, so a row puts each in a 320x360
+# cell. Asserting on the resolved cells checks the whole path -- the layout
+# resolved against the sources that are actually connected, and applied to a
+# pipeline that is already playing.
+curl -sf -H 'Content-Type: application/json' -X PUT \
+    -d '{"preset":"row"}' \
+    "$API/stream/$STREAM_ID/layout" >"$WORKDIR/layout.json" \
+    || fail "layout request failed"
+sed 's/^/  /' "$WORKDIR/layout.json"; echo
+python3 - "$WORKDIR/layout.json" <<'PY' || fail "layout did not resolve as expected"
+import json, sys
+cells = json.load(open(sys.argv[1]))['cells']
+expected = {'bg': {'x': 0, 'width': 320}, 'cam1': {'x': 320, 'width': 320}}
+for name, want in expected.items():
+    got = cells.get(name)
+    if got is None:
+        raise SystemExit('{} has no cell: {}'.format(name, cells))
+    if got['x'] != want['x'] or got['width'] != want['width']:
+        raise SystemExit('{}: expected {}, got x={} width={}'.format(
+            name, want, got['x'], got['width']))
+    if got['height'] != 360:
+        raise SystemExit('{}: expected full height, got {}'.format(
+            name, got['height']))
+PY
+pass "both sources laid out side by side on the running pipeline"
+sleep "$SETTLE_LAYOUT"
 
 say "Recording the mixed output"
 # Bound the capture by wall clock rather than with -t. Against a live RTMP

@@ -8,5 +8,7 @@ venv/
 .\#*
 *~
 
-# stray recordings from local testing
+# stray recordings and demo captures from local testing
 *.flv
+*.mp4
+*.gif
