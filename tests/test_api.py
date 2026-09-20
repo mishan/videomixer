@@ -366,6 +366,32 @@ async def test_get_layout_reports_the_spec_and_the_cells(client):
                                   'alpha': 1.0}
 
 
+async def test_transition_is_stored_with_the_layout(client):
+    await create_stream(client, 's1')
+    spec = {'preset': 'grid', 'transition': {
+        'duration': 0.4, 'easing': 'ease-in-out'}}
+    resp = await client.put('/stream/s1/layout', json=spec)
+    assert resp.status == 200
+    body = await (await client.get('/stream/s1/layout')).json()
+    assert body['layout'] == spec
+
+
+async def test_invalid_transition_is_bad_request(client):
+    await create_stream(client, 's1')
+    resp = await client.put('/stream/s1/layout', json={
+        'preset': 'grid', 'transition': {'duration': 4}})
+    assert resp.status == 400
+    assert 'transition duration' in (await resp.json())['error']
+
+
+async def test_very_large_transition_duration_is_bad_request(client):
+    await create_stream(client, 's1')
+    resp = await client.put('/stream/s1/layout', json={
+        'preset': 'grid', 'transition': {'duration': 10 ** 400}})
+    assert resp.status == 400
+    assert 'transition duration' in (await resp.json())['error']
+
+
 async def test_get_layout_with_none_set(client):
     await create_stream(client, 's1')
     body = await (await client.get('/stream/s1/layout')).json()

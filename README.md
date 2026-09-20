@@ -137,6 +137,21 @@ what the mixer is actually doing without recomputing it:
 moving anything: the picture stays exactly as it is, but the next source to
 join or drop no longer reshapes it.
 
+### Transitions
+
+Add `transition` to a preset or cells layout to animate changes to position,
+size, and opacity. It stays in the stored layout spec, so sources joining or
+leaving also animate the remaining cells:
+
+    {"preset": "grid", "transition": {"duration": 0.4, "easing": "ease-in-out"}}
+
+Duration is in seconds, greater than zero and at most 2. The default is 0.4.
+Easing may be `linear`, `ease-in`, `ease-out`, or `ease-in-out` (the default).
+Without `transition`, layout changes remain immediate. A newly joined source
+fades in at its destination; removal is immediate. Moving, resizing, changing
+fit, or changing opacity by hand cancels that source's animation and clears
+the tracked layout.
+
 ### Presets
 
 | preset                  | does                                                |
