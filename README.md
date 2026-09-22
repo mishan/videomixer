@@ -9,6 +9,13 @@ with the rest inset, or any set of rectangles the operator specifies.
 
 It never got past proof of concept: video mixing worked, audio did not.
 
+![Four sources joining a stream, moving through the grid, row, spotlight,
+picture-in-picture and solo layouts, and one leaving](docs/demo.gif)
+
+The demo is recorded from a real running mixer by `make demo`
+([`scripts/demo.sh`](scripts/demo.sh)), which also writes the full-size
+`docs/demo.mp4`.
+
 
 Origins
 -------
@@ -429,6 +436,7 @@ Development
 | `dev`  | install dev dependencies (flake8)           |
 | `lint` | run flake8, configured in `setup.cfg`       |
 | `test` | bring the stack up and run the e2e check    |
+| `demo` | record the README demo GIF                  |
 | `up`   | build and start the compose stack           |
 | `down` | stop the stack and remove volumes           |
 | `logs` | follow the container logs                   |
@@ -521,8 +529,6 @@ Known gaps
   distortion means cropping the overflow, which `compositor` cannot do on its
   own — it needs a `videocrop` per source, recomputed whenever a cell resizes
   or the source renegotiates its size.
-* Layout changes are instant. There is no transition between them, so a switch
-  from a grid to a solo is a hard cut on the frame it lands.
 * A layout cannot reference a source by anything but its id, so there is no
   "whoever is speaking" or "most recent to join" without a control surface
   computing it and setting a new layout.

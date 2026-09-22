@@ -12,3 +12,6 @@ venv/
 *.flv
 *.mp4
 *.gif
+
+# ...except the README demo, which scripts/demo.sh regenerates
+!docs/demo.gif

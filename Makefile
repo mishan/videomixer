@@ -1,7 +1,7 @@
 # `make` on its own prints this help rather than running a target, so an
 # argument-less invocation can never surprise you.
 .DEFAULT_GOAL := help
-.PHONY: help dev venv lint unit unit-docker check e2e test up down logs
+.PHONY: help dev venv lint unit unit-docker check e2e demo test up down logs
 
 help:  ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -34,6 +34,9 @@ check: lint unit  ## Lint and unit test, without touching Docker
 
 e2e: up  ## Bring the stack up and run the end-to-end check
 	./scripts/test_e2e.sh
+
+demo: up  ## Record docs/demo.mp4 and the README's docs/demo.gif
+	./scripts/demo.sh
 
 test: check e2e  ## Everything: lint, unit tests, then end-to-end
 
